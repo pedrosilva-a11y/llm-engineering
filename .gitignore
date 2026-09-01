@@ -1,2 +1,11 @@
-# Virtual Environment
-.venv
+# Virtual environment
+.venv/
+
+# Quality gates
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
