@@ -16,6 +16,7 @@ dev = [
 omit = [
     "*/__init__.py",
     "*/tests/*",
+    "serving/cost_models/catalog.py",
 ]
 
 [tool.mypy]
