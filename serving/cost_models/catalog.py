@@ -30,6 +30,20 @@ QWEN_2_5_1_5B = ModelSpecification(
 )
 
 
+# Small decoder-only model used for CPU engine development and integration tests.
+TOY_DECODER_MODEL = ModelSpecification(
+    name="toy-decoder-model",
+    n_layer=2,
+    d_model=64,
+    n_head=4,
+    n_kv_head=2,
+    d_head=16,
+    d_ff=256,
+    vocab_size=256,
+    norm_has_bias=False,
+)
+
+
 L4 = HardwareSpecification(
     name="L4",
     peak_bf16_tflops=121.0,
@@ -52,6 +66,7 @@ H100_SXM = HardwareSpecification(
 MODEL_CATALOG = {
     LLAMA_3_8B.name: LLAMA_3_8B,
     QWEN_2_5_1_5B.name: QWEN_2_5_1_5B,
+    TOY_DECODER_MODEL.name: TOY_DECODER_MODEL,
 }
 
 HARDWARE_CATALOG = {
