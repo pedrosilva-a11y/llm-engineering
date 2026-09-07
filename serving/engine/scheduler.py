@@ -51,6 +51,8 @@ class Scheduler:
         self._running: list[SequenceState] = []
         self._finished: list[SequenceState] = []
 
+        self._num_preemptions = 0
+
     @property
     def waiting_sequences(self) -> tuple[SequenceState, ...]:
         """Return sequences waiting to be scheduled."""
@@ -65,6 +67,11 @@ class Scheduler:
     def finished_sequences(self) -> tuple[SequenceState, ...]:
         """Return sequences whose generation has completed."""
         return tuple(self._finished)
+
+    @property
+    def num_preemptions(self) -> int:
+        """Return the total number of sequence preemptions."""
+        return self._num_preemptions
 
     @property
     def has_unfinished_requests(self) -> bool:
@@ -82,8 +89,9 @@ class Scheduler:
 
         Raises:
             ValueError: If the request identifier is already known, the prompt
-                exceeds the per-step token budget, or the prompt requires more
-                KV-cache blocks than the scheduler owns.
+                exceeds the per-step token budget, the maximum non-terminal sequence
+                length cannot fit in one re-prefill budget, or the maximum non-terminal
+                sequence length requires more KV-cache blocks than the scheduler owns.
         """
         if self._contains_request_id(request.request_id):
             raise ValueError(
@@ -98,23 +106,42 @@ class Scheduler:
                 "prefilled without chunked prefill."
             )
 
-        required_blocks = blocks_needed(
-            num_tokens=prompt_length,
+        max_kv_backed_tokens = prompt_length + request.max_new_tokens - 1
+
+        if max_kv_backed_tokens > self.configuration.max_batched_tokens:
+            raise ValueError(
+                "Maximum non-terminal sequence length exceeds max_batched_tokens "
+                "and cannot be re-prefilled without chunked prefill."
+            )
+
+        max_required_blocks = blocks_needed(
+            num_tokens=max_kv_backed_tokens,
             block_size=self.configuration.block_size,
         )
 
-        if required_blocks > self.configuration.num_blocks:
+        if max_required_blocks > self.configuration.num_blocks:
             raise ValueError(
-                "Prompt requires more KV-cache blocks than the scheduler owns.",
+                "Maximum non-terminal sequence length requires more KV-cache blocks "
+                "than the scheduler owns."
             )
 
         self._waiting.append(SequenceState(request=request))
+
+    def _blocks_required_for_sequence(
+        self,
+        sequence: SequenceState,
+    ) -> int:
+        """Return KV-cache blocks required for the sequence's current token history."""
+        return blocks_needed(
+            num_tokens=sequence.current_length,
+            block_size=self.configuration.block_size,
+        )
 
     def _can_admit(self, sequence: SequenceState) -> bool:
         """Return whether a waiting sequence can be admitted.
 
         Admission requires both an available sequence slot and enough free
-        KV-cache blocks for the request's prompt.
+        KV-cache blocks for the sequence's current token history.
 
         Args:
             sequence: Waiting sequence being considered for admission.
@@ -125,15 +152,12 @@ class Scheduler:
         if len(self._running) >= self.configuration.max_sequences:
             return False
 
-        required_blocks = blocks_needed(
-            num_tokens=len(sequence.request.prompt_token_ids),
-            block_size=self.configuration.block_size,
-        )
+        required_blocks = self._blocks_required_for_sequence(sequence)
 
         return required_blocks <= self.block_pool.num_free_blocks
 
     def _admit_sequence(self, sequence: SequenceState) -> None:
-        """Allocate prompt storage and move a waiting sequence to running.
+        """Allocate current sequence storage and move a waiting sequence to running.
 
         Args:
             sequence: Waiting sequence to admit.
@@ -147,7 +171,7 @@ class Scheduler:
 
         self.block_table.allocate_for_request(
             request_id=sequence.request.request_id,
-            num_tokens=len(sequence.request.prompt_token_ids),
+            num_tokens=sequence.current_length,
         )
 
         self._waiting.popleft()
@@ -190,8 +214,8 @@ class Scheduler:
             waiting requests for prefill in first-come-first-served order.
 
             This method mutates scheduler state when prefill requests are admitted by
-            allocating their prompt KV-cache blocks and moving them from waiting to
-            running.
+            allocating KV-cache blocks for their current token history and moving them
+            from waiting to running.
 
             Prefill admission also respects sequence concurrency and available KV-cache
             capacity. If the oldest waiting request cannot fit the remaining token
@@ -211,9 +235,9 @@ class Scheduler:
 
         while self._waiting and remaining_budget > 0:
             sequence = self._waiting[0]
-            prompt_length = len(sequence.request.prompt_token_ids)
+            prefill_tokens = sequence.current_length
 
-            if prompt_length > remaining_budget:
+            if prefill_tokens > remaining_budget:
                 break
 
             if not self._can_admit(sequence):
@@ -221,10 +245,10 @@ class Scheduler:
 
             self._admit_sequence(sequence)
             prefill_sequences.append(sequence)
-            remaining_budget -= prompt_length
+            remaining_budget -= prefill_tokens
 
         num_batched_tokens = len(decode_sequences) + sum(
-            len(sequence.request.prompt_token_ids) for sequence in prefill_sequences
+            sequence.current_length for sequence in prefill_sequences
         )
 
         return SchedulerOutput(
@@ -237,15 +261,16 @@ class Scheduler:
         """Reserve KV-cache storage for the next generated logical token.
 
         The token position is derived from the sequence's current length before the
-        generated token is appended. Storage already covered by an allocated block
-        requires no additional allocation.
+        generated token is appended. If KV capacity is exhausted, an eligible
+        running sequence is preempted and the reservation is retried.
 
         Args:
             sequence: Running sequence whose generated token requires KV storage.
 
         Raises:
-            RuntimeError: If the sequence is already finished, is not currently
-                running, or additional KV-cache capacity is unavailable.
+            RuntimeError: If the sequence is finished, is not currently running,
+                KV allocation fails for a reason other than capacity exhaustion,
+                or no eligible preemption victim exists.
         """
         if sequence.is_finished:
             raise RuntimeError(
@@ -257,10 +282,87 @@ class Scheduler:
                 "Cannot reserve KV-cache storage for a sequence that is not running.",
             )
 
+        try:
+            self.block_table.append_token(
+                request_id=sequence.request.request_id,
+                token_position=sequence.current_length,
+            )
+            return
+
+        except RuntimeError as error:
+            if "Not enough free blocks available" not in str(error):
+                raise
+
+        victim = self._select_preemption_victim(requester=sequence)
+
+        if victim is None:
+            raise RuntimeError(
+                "Not enough KV-cache capacity and no eligible preemption victim exists."
+            )
+
+        self._preempt_sequence(victim)
+
         self.block_table.append_token(
             request_id=sequence.request.request_id,
             token_position=sequence.current_length,
         )
+
+    def _release_sequence_resources(self, sequence: SequenceState) -> None:
+        """Release KV-cache blocks and remove a sequence from running state.
+
+        Args:
+            sequence: Running sequence whose scheduler resources should be released.
+        """
+        self.block_table.free_request(
+            request_id=sequence.request.request_id,
+        )
+
+        self._running = [
+            running for running in self._running if running is not sequence
+        ]
+
+    def _preempt_sequence(self, sequence: SequenceState) -> None:
+        """Preempt a running sequence and return it to the waiting queue.
+
+        KV-cache blocks owned by the sequence are released while its generated
+        token history is preserved for future recomputation.
+
+        Args:
+            sequence: Running sequence to preempt.
+
+        Raises:
+            RuntimeError: If the sequence is finished or is not currently running.
+        """
+        if sequence.is_finished:
+            raise RuntimeError("Cannot preempt a finished sequence.")
+
+        if not any(running is sequence for running in self._running):
+            raise RuntimeError("Cannot preempt a sequence that is not running.")
+
+        self._release_sequence_resources(sequence)
+
+        sequence.mark_preempted()
+        self._waiting.appendleft(sequence)
+        self._num_preemptions += 1
+
+    def _select_preemption_victim(
+        self,
+        requester: SequenceState,
+    ) -> SequenceState | None:
+        """Select the most recently scheduled eligible preemption victim.
+
+        Args:
+            requester: Sequence requesting additional KV-cache capacity.
+
+        Returns:
+            Last running sequence other than the requester, or None when no
+            eligible victim exists.
+        """
+        for sequence in reversed(self._running):
+            if sequence is not requester:
+                return sequence
+
+        return None
 
     def finish_sequence(
         self,
@@ -283,13 +385,7 @@ class Scheduler:
         if not any(running is sequence for running in self._running):
             raise RuntimeError("Cannot finish a sequence that is not running.")
 
-        self.block_table.free_request(
-            request_id=sequence.request.request_id,
-        )
-
-        self._running = [
-            running for running in self._running if running is not sequence
-        ]
+        self._release_sequence_resources(sequence)
 
         sequence.mark_finished(reason)
         self._finished.append(sequence)

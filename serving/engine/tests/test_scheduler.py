@@ -67,6 +67,7 @@ def test_scheduler_initializes_empty(
     assert scheduler.running_sequences == ()
     assert scheduler.finished_sequences == ()
     assert scheduler.has_unfinished_requests is False
+    assert scheduler.num_preemptions == 0
 
     assert scheduler.block_pool.num_blocks == 4
     assert scheduler.block_pool.num_free_blocks == 4
@@ -165,7 +166,7 @@ def test_duplicate_request_id_is_rejected(
 
 
 def test_prompt_exceeding_token_budget_is_rejected() -> None:
-    """Reject prompts that cannot fit in one Day 4 prefill budget."""
+    """Reject prompts that cannot fit in one prefill budget."""
     configuration = EngineConfiguration(
         block_size=16,
         num_blocks=8,
@@ -198,7 +199,7 @@ def test_prompt_equal_to_token_budget_is_accepted() -> None:
     request = Request(
         request_id="request-1",
         prompt_token_ids=tuple(range(16)),
-        max_new_tokens=8,
+        max_new_tokens=1,
     )
 
     scheduler.submit(request)
@@ -243,12 +244,84 @@ def test_prompt_equal_to_total_kv_capacity_is_accepted() -> None:
     request = Request(
         request_id="request-1",
         prompt_token_ids=tuple(range(32)),
-        max_new_tokens=8,
+        max_new_tokens=1,
     )
 
     scheduler.submit(request)
 
     assert len(scheduler.waiting_sequences) == 1
+    assert scheduler.block_pool.num_allocated_blocks == 0
+
+
+def test_submit_rejects_maximum_history_exceeding_reprefill_budget() -> None:
+    """Reject a request whose maximum KV-backed history cannot be re-prefilled."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=8,
+        max_batched_tokens=16,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    request = Request(
+        request_id="request-1",
+        prompt_token_ids=tuple(range(8)),
+        max_new_tokens=10,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Maximum non-terminal sequence length exceeds max_batched_tokens",
+    ):
+        scheduler.submit(request)
+
+    assert scheduler.waiting_sequences == ()
+    assert scheduler.block_pool.num_allocated_blocks == 0
+
+
+def test_submit_rejects_maximum_history_exceeding_total_kv_capacity() -> None:
+    """Reject a request whose maximum KV-backed history exceeds total KV capacity."""
+    configuration = EngineConfiguration(
+        block_size=4,
+        num_blocks=2,
+        max_batched_tokens=12,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    request = Request(
+        request_id="request-1",
+        prompt_token_ids=(1, 2, 3, 4),
+        max_new_tokens=6,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="more KV-cache blocks than the scheduler owns",
+    ):
+        scheduler.submit(request)
+
+    assert scheduler.waiting_sequences == ()
+    assert scheduler.block_pool.num_allocated_blocks == 0
+
+
+def test_submit_excludes_terminal_token_from_maximum_kv_requirement() -> None:
+    """Exclude the terminal generated token from maximum KV-cache requirements."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=1,
+        max_batched_tokens=16,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    request = Request(
+        request_id="request-1",
+        prompt_token_ids=tuple(range(15)),
+        max_new_tokens=2,
+    )
+
+    scheduler.submit(request)
+
+    assert len(scheduler.waiting_sequences) == 1
+    assert scheduler.waiting_sequences[0].request is request
     assert scheduler.block_pool.num_allocated_blocks == 0
 
 
@@ -283,6 +356,80 @@ def test_admit_waiting_sequence_allocates_prompt_blocks(
 
     assert scheduler.block_pool.num_allocated_blocks == 2
     assert scheduler.block_pool.num_free_blocks == 2
+
+
+def test_admission_uses_current_length_for_kv_capacity() -> None:
+    """Keep a sequence waiting when its current history cannot fit available KV."""
+    configuration = EngineConfiguration(
+        block_size=4,
+        num_blocks=3,
+        max_sequences=2,
+        max_batched_tokens=16,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    scheduler.submit(
+        Request(
+            request_id="running-request",
+            prompt_token_ids=(1, 2, 3, 4),
+            max_new_tokens=1,
+        ),
+    )
+    scheduler._admit_waiting_sequences()
+
+    assert scheduler.block_pool.num_free_blocks == 2
+
+    scheduler.submit(
+        Request(
+            request_id="waiting-request",
+            prompt_token_ids=(5, 6, 7, 8),
+            max_new_tokens=6,
+        ),
+    )
+
+    sequence = scheduler.waiting_sequences[0]
+    sequence.generated_token_ids.extend([9, 10, 11, 12, 13])
+
+    admitted = scheduler._admit_waiting_sequences()
+
+    assert sequence.current_length == 9
+    assert admitted == ()
+    assert scheduler.waiting_sequences == (sequence,)
+    assert len(scheduler.running_sequences) == 1
+    assert scheduler.block_pool.num_allocated_blocks == 1
+    assert scheduler.block_pool.num_free_blocks == 2
+
+
+def test_admission_allocates_blocks_for_current_sequence_history() -> None:
+    """Allocate KV blocks for prompt and previously generated token history."""
+    configuration = EngineConfiguration(
+        block_size=4,
+        num_blocks=4,
+        max_sequences=2,
+        max_batched_tokens=16,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    request_id = "request-1"
+
+    scheduler.submit(
+        Request(
+            request_id=request_id,
+            prompt_token_ids=(1, 2, 3, 4),
+            max_new_tokens=8,
+        ),
+    )
+
+    sequence = scheduler.waiting_sequences[0]
+    sequence.generated_token_ids.extend([5, 6, 7, 8, 9])
+
+    admitted = scheduler._admit_waiting_sequences()
+
+    assert sequence.current_length == 9
+    assert admitted == (sequence,)
+    assert scheduler.block_table.blocks_for_request(request_id) == (0, 1, 2)
+    assert scheduler.block_pool.num_allocated_blocks == 3
+    assert scheduler.block_pool.num_free_blocks == 1
 
 
 def test_admit_waiting_sequences_returns_sequences_in_fcfs_order(
@@ -553,7 +700,7 @@ def test_schedule_admits_waiting_requests_as_prefill() -> None:
     scheduler = Scheduler(configuration=configuration)
 
     request_id1, request_id2 = "request-1", "request-2"
-    max_new_tokens = 8
+    max_new_tokens = 1
 
     scheduler.submit(
         Request(
@@ -575,8 +722,8 @@ def test_schedule_admits_waiting_requests_as_prefill() -> None:
     assert output.decode_sequences == ()
 
     assert [sequence.request.request_id for sequence in output.prefill_sequences] == [
-        "request-1",
-        "request-2",
+        request_id1,
+        request_id2,
     ]
 
     assert output.num_batched_tokens == 7
@@ -584,7 +731,36 @@ def test_schedule_admits_waiting_requests_as_prefill() -> None:
 
     assert [
         sequence.request.request_id for sequence in scheduler.running_sequences
-    ] == ["request-1", "request-2"]
+    ] == [request_id1, request_id2]
+
+
+def test_schedule_accounts_for_current_length_during_prefill() -> None:
+    """Charge the full current sequence history against the prefill token budget."""
+    configuration = EngineConfiguration(
+        block_size=4,
+        num_blocks=4,
+        max_sequences=2,
+        max_batched_tokens=8,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2, 3, 4),
+            max_new_tokens=5,
+        ),
+    )
+
+    sequence = scheduler.waiting_sequences[0]
+    sequence.generated_token_ids.extend([5, 6, 7])
+
+    output = scheduler.schedule()
+
+    assert sequence.current_length == 7
+    assert output.decode_sequences == ()
+    assert output.prefill_sequences == (sequence,)
+    assert output.num_batched_tokens == 7
 
 
 def test_schedule_selects_existing_running_sequences_as_decode(
@@ -629,7 +805,7 @@ def test_schedule_prioritizes_decode_before_prefill() -> None:
 
     request_decode_id1, request_decode_id2 = "decode-1", "decode-2"
     request_prefill_id1, request_prefill_id2 = "prefill-1", "prefill-2"
-    max_new_tokens = 8
+    max_new_tokens = 3
 
     scheduler.submit(
         Request(
@@ -680,7 +856,7 @@ def test_schedule_prioritizes_decode_before_prefill() -> None:
     ] == ["prefill-2"]
 
 
-def test_schedule_preserves_fcfs_when_head_prompt_exceeds_remaining_budget() -> None:
+def test_schedule_preserves_fcfs_when_head_prefill_exceeds_remaining_budget() -> None:
     """Do not skip the queue head when its prompt exceeds remaining budget."""
     configuration = EngineConfiguration(
         block_size=16,
@@ -693,7 +869,7 @@ def test_schedule_preserves_fcfs_when_head_prompt_exceeds_remaining_budget() -> 
     running_req = "running-request"
     large_req = "large-request"
     small_req = "small-request"
-    max_new_tokens = 8
+    max_new_tokens = 1
 
     scheduler.submit(
         Request(
@@ -796,18 +972,20 @@ def test_waiting_request_is_admitted_after_running_request_releases_blocks() -> 
     )
     scheduler = Scheduler(configuration=configuration)
 
+    max_new_tokens = 1
+
     scheduler.submit(
         Request(
             request_id="request-a",
             prompt_token_ids=tuple(range(32)),
-            max_new_tokens=8,
+            max_new_tokens=max_new_tokens,
         ),
     )
     scheduler.submit(
         Request(
             request_id="request-b",
             prompt_token_ids=tuple(range(32)),
-            max_new_tokens=8,
+            max_new_tokens=max_new_tokens,
         ),
     )
 
@@ -963,41 +1141,352 @@ def test_reserve_generated_token_rejects_finished_sequence(
     assert scheduler.block_pool.num_allocated_blocks == 0
 
 
-def test_reserve_generated_token_fails_atomically_when_pool_is_exhausted() -> None:
-    """Preserve KV state when decode growth requires an unavailable block."""
+def test_reserve_generated_token_preempts_victim_and_retries() -> None:
+    """Preempt another running sequence and retry KV reservation."""
     configuration = EngineConfiguration(
         block_size=16,
-        num_blocks=1,
-        max_sequences=1,
-        max_batched_tokens=16,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=32,
     )
     scheduler = Scheduler(configuration=configuration)
 
-    request_id = "request-1"
+    requester_id = "requester"
+    victim_id = "victim"
 
     scheduler.submit(
         Request(
-            request_id=request_id,
+            request_id=requester_id,
             prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        ),
+    )
+    scheduler.submit(
+        Request(
+            request_id=victim_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=1,
+        ),
+    )
+
+    requester, victim = scheduler._admit_waiting_sequences()
+
+    assert scheduler.block_table.blocks_for_request(requester_id) == (0,)
+    assert scheduler.block_table.blocks_for_request(victim_id) == (1,)
+    assert scheduler.block_pool.num_free_blocks == 0
+
+    scheduler.reserve_generated_token(requester)
+
+    assert scheduler.num_preemptions == 1
+    assert requester.status == SequenceStatus.RUNNING
+    assert victim.status == SequenceStatus.PREEMPTED
+
+    assert scheduler.running_sequences == (requester,)
+    assert scheduler.waiting_sequences == (victim,)
+
+    assert scheduler.block_table.blocks_for_request(requester_id) == (0, 1)
+
+    with pytest.raises(ValueError, match="Unknown request_id"):
+        scheduler.block_table.blocks_for_request(victim_id)
+
+    assert scheduler.block_pool.num_allocated_blocks == 2
+    assert scheduler.block_pool.num_free_blocks == 0
+
+    assert_scheduler_invariant(scheduler)
+
+
+def test_reserve_generated_token_does_not_preempt_when_block_is_reused() -> None:
+    """Avoid preemption when reservation needs no additional KV block."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=32,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    requester_id, other_request_id = "requester", "other-request"
+
+    scheduler.submit(
+        Request(
+            request_id=requester_id,
+            prompt_token_ids=tuple(range(15)),
+            max_new_tokens=2,
+        ),
+    )
+    scheduler.submit(
+        Request(
+            request_id=other_request_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=1,
+        ),
+    )
+
+    requester, other_sequence = scheduler._admit_waiting_sequences()
+
+    assert scheduler.block_pool.num_free_blocks == 0
+
+    scheduler.reserve_generated_token(requester)
+
+    assert scheduler.running_sequences == (requester, other_sequence)
+    assert scheduler.waiting_sequences == ()
+
+    assert requester.status == SequenceStatus.RUNNING
+    assert other_sequence.status == SequenceStatus.RUNNING
+
+    assert scheduler.block_table.blocks_for_request(requester_id) == (0,)
+    assert scheduler.block_table.blocks_for_request(other_request_id) == (1,)
+
+    assert scheduler.block_pool.num_free_blocks == 0
+
+
+# Preemption
+
+
+def test_preemption_count_tracks_successful_preemptions(
+    scheduler: Scheduler,
+) -> None:
+    """Count each successful sequence preemption."""
+    scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1,),
+            max_new_tokens=8,
+        ),
+    )
+    scheduler.submit(
+        Request(
+            request_id="request-2",
+            prompt_token_ids=(2,),
+            max_new_tokens=8,
+        ),
+    )
+
+    first_sequence, second_sequence = scheduler._admit_waiting_sequences()
+
+    assert scheduler.num_preemptions == 0
+
+    scheduler._preempt_sequence(second_sequence)
+
+    assert scheduler.num_preemptions == 1
+
+    scheduler._preempt_sequence(first_sequence)
+
+    assert scheduler.num_preemptions == 2
+
+
+def test_preempt_sequence_releases_kv_and_moves_to_waiting_front(
+    scheduler: Scheduler,
+) -> None:
+    """Release victim KV blocks and move the sequence to the waiting front."""
+    victim_request_id = "victim"
+    already_waiting_request_id = "already-waiting"
+    max_new_tokens = 8
+
+    scheduler.submit(
+        Request(
+            request_id=victim_request_id,
+            prompt_token_ids=tuple(range(17)),
+            max_new_tokens=max_new_tokens,
+        ),
+    )
+
+    victim = scheduler._admit_waiting_sequences()[0]
+
+    scheduler.submit(
+        Request(
+            request_id=already_waiting_request_id,
+            prompt_token_ids=(1,),
+            max_new_tokens=max_new_tokens,
+        ),
+    )
+
+    assert scheduler.block_table.blocks_for_request(victim_request_id) == (0, 1)
+    assert scheduler.block_pool.num_allocated_blocks == 2
+
+    scheduler._preempt_sequence(victim)
+
+    assert_scheduler_invariant(scheduler)
+
+    assert victim.status == SequenceStatus.PREEMPTED
+    assert scheduler.running_sequences == ()
+
+    assert [
+        sequence.request.request_id for sequence in scheduler.waiting_sequences
+    ] == [
+        victim_request_id,
+        already_waiting_request_id,
+    ]
+
+    assert scheduler.block_pool.num_allocated_blocks == 0
+    assert scheduler.block_pool.num_free_blocks == 4
+
+    with pytest.raises(ValueError, match="Unknown request_id"):
+        scheduler.block_table.blocks_for_request(victim_request_id)
+
+
+def test_preempt_sequence_preserves_generated_history(
+    scheduler: Scheduler,
+) -> None:
+    """Preserve generated tokens and logical length across preemption."""
+    request_id1 = "request-1"
+
+    scheduler.submit(
+        Request(
+            request_id=request_id1,
+            prompt_token_ids=(1, 2, 3),
             max_new_tokens=8,
         ),
     )
 
     sequence = scheduler._admit_waiting_sequences()[0]
 
-    assert scheduler.block_table.blocks_for_request(request_id) == (0,)
-    assert scheduler.block_pool.num_allocated_blocks == 1
-    assert scheduler.block_pool.num_free_blocks == 0
+    sequence.generated_token_ids.extend([4, 5, 6])
 
-    with pytest.raises(RuntimeError, match="Not enough free blocks available"):
-        scheduler.reserve_generated_token(sequence)
+    generated_before = tuple(sequence.generated_token_ids)
+    current_length_before = sequence.current_length
 
-    assert scheduler.block_table.blocks_for_request(request_id) == (0,)
-    assert scheduler.block_pool.num_allocated_blocks == 1
-    assert scheduler.block_pool.num_free_blocks == 0
+    scheduler._preempt_sequence(sequence)
 
-    assert scheduler.running_sequences == (sequence,)
-    assert sequence.status == SequenceStatus.RUNNING
+    assert sequence.status == SequenceStatus.PREEMPTED
+    assert tuple(sequence.generated_token_ids) == generated_before
+    assert sequence.current_length == current_length_before
+    assert sequence.finish_reason is None
+
+    assert scheduler.waiting_sequences == (sequence,)
+    assert scheduler.running_sequences == ()
+
+    with pytest.raises(ValueError, match="Unknown request_id"):
+        scheduler.block_table.blocks_for_request(request_id1)
+
+
+def test_preempted_sequence_is_readmitted_after_kv_becomes_available() -> None:
+    """Readmit a preempted sequence after the requester releases KV capacity."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=32,
+    )
+    scheduler = Scheduler(configuration=configuration)
+
+    victim_request_id = "victim"
+
+    scheduler.submit(
+        Request(
+            request_id="requester",
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        ),
+    )
+    scheduler.submit(
+        Request(
+            request_id=victim_request_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=1,
+        ),
+    )
+
+    requester, victim = scheduler._admit_waiting_sequences()
+
+    scheduler.reserve_generated_token(requester)
+
+    assert victim.status == SequenceStatus.PREEMPTED
+    assert len(scheduler.waiting_sequences) == 1
+    assert scheduler.waiting_sequences[0] is victim
+
+    scheduler.finish_sequence(
+        sequence=requester,
+        reason=FinishReason.LENGTH,
+    )
+
+    output = scheduler.schedule()
+
+    assert output.prefill_sequences == (victim,)
+    assert len(scheduler.waiting_sequences) == 0
+    assert len(scheduler.running_sequences) == 1
+    assert scheduler.running_sequences[0] is victim
+    assert scheduler.running_sequences[0].status == SequenceStatus.RUNNING
+
+    assert scheduler.block_table.blocks_for_request(victim_request_id) == (0,)
+    assert_scheduler_invariant(scheduler)
+
+
+def test_preemption_victim_is_last_running_sequence(
+    scheduler: Scheduler,
+) -> None:
+    """Select the most recently admitted running sequence as the victim."""
+    max_new_tokens = 8
+
+    scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1,),
+            max_new_tokens=max_new_tokens,
+        ),
+    )
+    scheduler.submit(
+        Request(
+            request_id="request-2",
+            prompt_token_ids=(2,),
+            max_new_tokens=max_new_tokens,
+        )
+    )
+
+    first_sequence, second_sequence = scheduler._admit_waiting_sequences()
+
+    victim = scheduler._select_preemption_victim(
+        requester=first_sequence,
+    )
+
+    assert victim is second_sequence
+
+
+def test_preemption_victim_skips_requester_at_running_tail(
+    scheduler: Scheduler,
+) -> None:
+    """Select the previous running sequence when the requester is last."""
+    scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1,),
+            max_new_tokens=8,
+        ),
+    )
+    scheduler.submit(
+        Request(
+            request_id="request-2",
+            prompt_token_ids=(2,),
+            max_new_tokens=8,
+        ),
+    )
+
+    first_sequence, second_sequence = scheduler._admit_waiting_sequences()
+
+    victim = scheduler._select_preemption_victim(
+        requester=second_sequence,
+    )
+
+    assert victim is first_sequence
+
+
+def test_preemption_victim_excludes_requester(scheduler: Scheduler) -> None:
+    """Never select the requesting sequence as its own preemption victim."""
+    scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1,),
+            max_new_tokens=8,
+        ),
+    )
+
+    requester = scheduler._admit_waiting_sequences()[0]
+
+    victim = scheduler._select_preemption_victim(
+        requester=requester,
+    )
+
+    assert victim is None
 
 
 # Completion and release

@@ -230,7 +230,7 @@ def test_step_reserves_kv_for_non_terminal_generated_token() -> None:
         block_size=16,
         num_blocks=2,
         max_sequences=1,
-        max_batched_tokens=16,
+        max_batched_tokens=32,
     )
     model_runner = DeterministicStubModelRunner(
         vocab_size=10,
@@ -296,6 +296,151 @@ def test_terminal_token_does_not_require_additional_kv_block() -> None:
 
     assert engine.scheduler.block_pool.num_allocated_blocks == 0
     assert engine.scheduler.block_pool.num_free_blocks == 1
+
+
+def test_step_discards_output_for_sequence_preempted_during_same_batch() -> None:
+    """Discard stale model output for a sequence preempted in the same step."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=32,
+        eos_token_id=0,
+    )
+    model_runner = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        device="cpu",
+    )
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    requester_id = "requester"
+    victim_id = "victim"
+
+    engine.submit(
+        Request(
+            request_id=requester_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        ),
+    )
+    engine.submit(
+        Request(
+            request_id=victim_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        ),
+    )
+
+    with patch.object(
+        model_runner,
+        "forward",
+        wraps=model_runner.forward,
+    ) as forward_mock:
+        finished = engine.step()
+
+        forward_mock.assert_called_once()
+
+    assert finished == ()
+
+    assert len(engine.running_sequences) == 1
+    requester = engine.running_sequences[0]
+
+    assert requester.request.request_id == requester_id
+    assert requester.status == SequenceStatus.RUNNING
+    assert requester.generated_token_ids == [5]
+
+    assert len(engine.waiting_sequences) == 1
+    victim = engine.waiting_sequences[0]
+
+    assert victim.request.request_id == victim_id
+    assert victim.status == SequenceStatus.PREEMPTED
+    assert victim.generated_token_ids == []
+
+    assert engine.scheduler.block_table.blocks_for_request(requester_id) == (0, 1)
+
+    with pytest.raises(ValueError, match="Unknown request_id"):
+        engine.scheduler.block_table.blocks_for_request(victim_id)
+
+    assert engine.scheduler.block_pool.num_allocated_blocks == 2
+    assert engine.scheduler.block_pool.num_free_blocks == 0
+
+
+def test_preempted_sequence_is_reprefilled_on_later_engine_step() -> None:
+    """Re-prefill a preempted sequence after KV capacity becomes available."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=32,
+        eos_token_id=0,
+    )
+    model_runner = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        device="cpu",
+    )
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    requester_id = "requester"
+    victim_id = "victim"
+
+    engine.submit(
+        Request(
+            request_id=requester_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        ),
+    )
+    engine.submit(
+        Request(
+            request_id=victim_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        ),
+    )
+
+    engine.step()
+
+    assert len(engine.running_sequences) == 1
+    assert len(engine.waiting_sequences) == 1
+
+    victim = engine.waiting_sequences[0]
+
+    assert victim.request.request_id == victim_id
+    assert victim.status == SequenceStatus.PREEMPTED
+    assert victim.generated_token_ids == []
+
+    # The requester finishes here. The victim cannot be admitted during this
+    # step because scheduling happened before the requester released its KV.
+    finished = engine.step()
+
+    assert len(finished) == 1
+    assert finished[0].request.request_id == requester_id
+
+    assert len(engine.running_sequences) == 0
+    assert len(engine.waiting_sequences) == 1
+    assert engine.waiting_sequences[0] is victim
+
+    # The following step can now re-admit the victim as prefill work.
+    engine.step()
+
+    assert len(engine.waiting_sequences) == 0
+    assert len(engine.running_sequences) == 1
+    assert engine.running_sequences[0] is victim
+    assert engine.running_sequences[0].status == SequenceStatus.RUNNING
+
+    assert engine.running_sequences[0].generated_token_ids == [5]
+
+    assert engine.scheduler.block_table.blocks_for_request(victim_id) == (0, 1)
 
 
 def test_sequence_finishes_on_eos(

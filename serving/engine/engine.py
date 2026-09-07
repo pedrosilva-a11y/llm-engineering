@@ -4,7 +4,7 @@ from serving.engine.config import EngineConfiguration
 from serving.engine.model_runner import ModelRunner
 from serving.engine.request import Request
 from serving.engine.scheduler import Scheduler
-from serving.engine.sequence import FinishReason, SequenceState
+from serving.engine.sequence import FinishReason, SequenceState, SequenceStatus
 
 
 class Engine:
@@ -90,6 +90,10 @@ class Engine:
         reserve additional KV capacity. Completed sequences are finalized through the
         scheduler.
 
+        If reactive KV-cache preemption removes a sequence that was already included in
+        the current model batch, its computed output is discarded because the sequence
+        must be re-prefilled before generation can continue.
+
         Returns:
             Sequences that completed during this engine step.
         """
@@ -108,6 +112,9 @@ class Engine:
         finished_this_step: list[SequenceState] = []
 
         for index, sequence in enumerate(batch):
+            if sequence.status == SequenceStatus.PREEMPTED:
+                continue
+
             token_id = int(logits[index].argmax().item())
 
             finishes_with_eos = token_id == self.configuration.eos_token_id

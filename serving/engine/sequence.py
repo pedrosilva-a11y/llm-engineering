@@ -11,6 +11,7 @@ class SequenceStatus(StrEnum):
 
     WAITING = "waiting"
     RUNNING = "running"
+    PREEMPTED = "preempted"
     FINISHED = "finished"
 
 
@@ -78,12 +79,28 @@ class SequenceState:
         """Mark the sequence as actively running.
 
         Raises:
-            ValueError: If the sequence is already finished.
+            RuntimeError: If the sequence is not defined as waiting or preempted.
         """
-        if self.is_finished:
-            raise ValueError("Cannot mark a finished sequence as running.")
+        if self.status not in {
+            SequenceStatus.WAITING,
+            SequenceStatus.PREEMPTED,
+        }:
+            raise RuntimeError(
+                "Only a waiting or preempted sequence can be marked running.",
+            )
 
         self.status = SequenceStatus.RUNNING
+
+    def mark_preempted(self) -> None:
+        """Mark a running sequence as preempted.
+
+        Raises:
+            RuntimeError: If the sequence is not currently running.
+        """
+        if self.status != SequenceStatus.RUNNING:
+            raise RuntimeError("Only a running sequence can be preempted.")
+
+        self.status = SequenceStatus.PREEMPTED
 
     def mark_finished(self, reason: FinishReason) -> None:
         """Mark generation as completed.

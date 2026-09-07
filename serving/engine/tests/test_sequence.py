@@ -82,6 +82,54 @@ def test_mark_running(
     assert sequence.is_finished is False
 
 
+def test_mark_preempted_preserves_generation_state(
+    generation_request: Request,
+) -> None:
+    """Preempt a running sequence without losing generated-token progress."""
+    sequence = SequenceState(request=generation_request)
+
+    sequence.mark_running()
+    sequence.append_token(40)
+    sequence.append_token(50)
+
+    sequence.mark_preempted()
+
+    assert sequence.status == SequenceStatus.PREEMPTED
+    assert sequence.generated_token_ids == [40, 50]
+    assert sequence.num_generated_tokens == 2
+    assert sequence.current_length == 5
+
+    assert sequence.finish_reason is None
+    assert sequence.is_finished is False
+
+
+def test_preempted_sequence_can_be_marked_running_again(
+    generation_request: Request,
+) -> None:
+    """Return a preempted sequence to the running state."""
+    sequence = SequenceState(request=generation_request)
+
+    sequence.mark_running()
+    sequence.mark_preempted()
+    sequence.mark_running()
+
+    assert sequence.status == SequenceStatus.RUNNING
+    assert sequence.finish_reason is None
+    assert sequence.is_finished is False
+
+
+def test_waiting_sequence_cannot_be_marked_preempted(
+    generation_request: Request,
+) -> None:
+    """Reject preemption of a sequence that is not running."""
+    sequence = SequenceState(request=generation_request)
+
+    with pytest.raises(RuntimeError, match="Only a running sequence can be preempted"):
+        sequence.mark_preempted()
+
+    assert sequence.status == SequenceStatus.WAITING
+
+
 @pytest.mark.parametrize(
     "finish_reason",
     [
@@ -125,8 +173,8 @@ def test_mark_finished_sequence_as_running_is_rejected(
     sequence.mark_finished(reason=FinishReason.EOS)
 
     with pytest.raises(
-        ValueError,
-        match="Cannot mark a finished sequence as running",
+        RuntimeError,
+        match="Only a waiting or preempted sequence can be marked running",
     ):
         sequence.mark_running()
 
