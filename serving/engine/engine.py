@@ -1,24 +1,22 @@
 """Core generation loop for the LLM inference engine."""
 
-from collections import deque
-
 from serving.engine.config import EngineConfiguration
 from serving.engine.model_runner import ModelRunner
 from serving.engine.request import Request
+from serving.engine.scheduler import Scheduler
 from serving.engine.sequence import FinishReason, SequenceState
 
 
 class Engine:
-    """Coordinate request admission and batched autoregressive generation.
+    """Coordinate scheduling, model execution, and autoregressive generation.
 
-    The engine owns the lifecycle of submitted generation requests. It keeps
-    waiting, running, and finished sequences, admits requests up to the
-    configured concurrency limit, executes active sequences as one batch, and
-    applies terminal conditions after each generated token.
+    The engine delegates request queues, admission policy, and KV-cache lifecycle
+    management to ``Scheduler``. It executes the work selected for each step as one
+    batched model call, applies generated tokens to sequence state, and reports
+    completed sequences.
 
-    Model execution is delegated to a ``ModelRunner`` so the control loop
-    remains independent of the concrete model implementation and execution
-    device.
+    Model execution is delegated to ``ModelRunner`` so the control loop remains
+    independent of the concrete model implementation and execution device.
     """
 
     def __init__(
@@ -34,10 +32,7 @@ class Engine:
         """
         self.configuration = configuration
         self.model_runner = model_runner
-
-        self._waiting: deque[SequenceState] = deque()
-        self._running: list[SequenceState] = []
-        self._finished: list[SequenceState] = []
+        self.scheduler = Scheduler(configuration=configuration)
 
     @property
     def waiting_sequences(self) -> tuple[SequenceState, ...]:
@@ -46,16 +41,16 @@ class Engine:
         Returns:
             Waiting sequences in queue order.
         """
-        return tuple(self._waiting)
+        return self.scheduler.waiting_sequences
 
     @property
     def running_sequences(self) -> tuple[SequenceState, ...]:
         """Return sequences currently admitted for execution.
 
         Returns:
-            Sequences currently participating in autoregressive decoding.
+            Sequences currently admitted for execution.
         """
-        return tuple(self._running)
+        return self.scheduler.running_sequences
 
     @property
     def finished_sequences(self) -> tuple[SequenceState, ...]:
@@ -64,7 +59,7 @@ class Engine:
         Returns:
             Sequences whose generation has completed.
         """
-        return tuple(self._finished)
+        return self.scheduler.finished_sequences
 
     @property
     def has_unfinished_requests(self) -> bool:
@@ -73,118 +68,71 @@ class Engine:
         Returns:
             True when at least one waiting or running sequence remains.
         """
-        return bool(self._waiting or self._running)
-
-    def _contains_request_id(self, request_id: str) -> bool:
-        """Return whether a request identifier is already known to the engine.
-
-        Args:
-            request_id: Request identifier to search for.
-
-        Returns:
-            True when the identifier belongs to a waiting, running, or finished
-            sequence.
-        """
-        return any(
-            sequence.request.request_id == request_id
-            for sequence in (
-                *self._waiting,
-                *self._running,
-                *self._finished,
-            )
-        )
-
-    def _admit_waiting_sequences(self) -> None:
-        """Admit waiting sequences while execution capacity is available."""
-        while self._waiting and len(self._running) < self.configuration.max_sequences:
-            sequence = self._waiting.popleft()
-            sequence.mark_running()
-            self._running.append(sequence)
+        return self.scheduler.has_unfinished_requests
 
     def submit(self, request: Request) -> None:
-        """Submit one generation request to the engine.
-
-        The request is converted into mutable sequence state and placed in the
-        waiting queue. If execution capacity is available, waiting sequences are
-        admitted immediately.
+        """Submit one generation request to the scheduler.
 
         Args:
             request: Immutable generation request to submit.
-
-        Raises:
-            ValueError: If the request identifier has already been submitted.
         """
-        if self._contains_request_id(request.request_id):
-            raise ValueError(
-                f"request_id {request.request_id!r} has already been submitted."
-            )
-
-        self._waiting.append(SequenceState(request=request))
-        self._admit_waiting_sequences()
-
-    def _finish_sequence(
-        self,
-        sequence: SequenceState,
-        reason: FinishReason,
-    ) -> None:
-        """Mark a running sequence as finished.
-
-        Args:
-            sequence: Running sequence whose generation has completed.
-            reason: Reason generation terminated.
-        """
-        sequence.mark_finished(reason)
+        self.scheduler.submit(request=request)
 
     def step(self) -> tuple[SequenceState, ...]:
-        """Advance active sequences by one autoregressive decoding step.
+        """Advance scheduled sequences by one inference-engine step.
 
-        Waiting sequences are admitted while capacity is available. If no
-        sequences are running, model execution is skipped.
+        The scheduler selects existing decode work and newly admitted prefill work.
+        If no work is selected, model execution is skipped. Otherwise, all selected
+        sequences are processed in one batched model call.
 
-        Otherwise, all running sequences are processed in one batched model
-        execution. One token is selected for each sequence and checked against
-        EOS and maximum-generation stopping conditions.
+        KV-cache storage is reserved before appending generated tokens that will be
+        needed by a future decode step. Terminal EOS or length-limited tokens do not
+        reserve additional KV capacity. Completed sequences are finalized through the
+        scheduler.
 
         Returns:
-            Sequences that completed during this decoding step.
+            Sequences that completed during this engine step.
         """
-        self._admit_waiting_sequences()
+        scheduler_output = self.scheduler.schedule()
 
-        if not self._running:
+        batch = (
+            *scheduler_output.decode_sequences,
+            *scheduler_output.prefill_sequences,
+        )
+
+        if not batch:
             return ()
 
-        running_snapshot = tuple(self._running)
-
-        logits = self.model_runner.forward(running_snapshot)
+        logits = self.model_runner.forward(batch)
 
         finished_this_step: list[SequenceState] = []
 
-        for index, sequence in enumerate(running_snapshot):
+        for index, sequence in enumerate(batch):
             token_id = int(logits[index].argmax().item())
+
+            finishes_with_eos = token_id == self.configuration.eos_token_id
+            finishes_with_length = (
+                sequence.num_generated_tokens + 1 >= sequence.request.max_new_tokens
+            )
+
+            if not finishes_with_eos and not finishes_with_length:
+                self.scheduler.reserve_generated_token(sequence)
 
             sequence.append_token(token_id)
 
-            if token_id == self.configuration.eos_token_id:
-                self._finish_sequence(
+            if finishes_with_eos:
+                self.scheduler.finish_sequence(
                     sequence=sequence,
                     reason=FinishReason.EOS,
                 )
                 finished_this_step.append(sequence)
 
-            elif sequence.num_generated_tokens >= sequence.request.max_new_tokens:
-                self._finish_sequence(
+            elif finishes_with_length:
+                self.scheduler.finish_sequence(
                     sequence=sequence,
                     reason=FinishReason.LENGTH,
                 )
                 finished_this_step.append(sequence)
-
-        self._running = [
-            sequence for sequence in self._running if not sequence.is_finished
-        ]
-
-        self._finished.extend(finished_this_step)
-
-        self._admit_waiting_sequences()
 
         return tuple(finished_this_step)
 

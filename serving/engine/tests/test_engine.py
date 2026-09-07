@@ -49,25 +49,28 @@ def engine(
     )
 
 
-def test_submit_admits_request_up_to_capacity(
+def test_submit_keeps_requests_waiting_until_scheduled(
     engine: Engine,
 ) -> None:
-    """Admit submitted requests up to the configured sequence capacity."""
+    """Keep submitted requests waiting until an engine step schedules them."""
     max_new_tokens = 8
+    request_id1 = "request-1"
+    request_id2 = "request-2"
+    request_id3 = "request-3"
 
     requests = [
         Request(
-            request_id="request-1",
+            request_id=request_id1,
             prompt_token_ids=(1, 2),
             max_new_tokens=max_new_tokens,
         ),
         Request(
-            request_id="request-2",
+            request_id=request_id2,
             prompt_token_ids=(3, 4),
             max_new_tokens=max_new_tokens,
         ),
         Request(
-            request_id="request-3",
+            request_id=request_id3,
             prompt_token_ids=(5, 6),
             max_new_tokens=max_new_tokens,
         ),
@@ -76,26 +79,20 @@ def test_submit_admits_request_up_to_capacity(
     for request in requests:
         engine.submit(request)
 
-    assert [sequence.request.request_id for sequence in engine.running_sequences] == [
-        "request-1",
-        "request-2",
-    ]
+    assert engine.running_sequences == ()
 
     assert [sequence.request.request_id for sequence in engine.waiting_sequences] == [
-        "request-3"
+        request_id1,
+        request_id2,
+        request_id3,
     ]
-
-    assert all(
-        sequence.status == SequenceStatus.RUNNING
-        for sequence in engine.running_sequences
-    )
 
     assert all(
         sequence.status == SequenceStatus.WAITING
         for sequence in engine.waiting_sequences
     )
 
-    assert not engine.finished_sequences
+    assert engine.finished_sequences == ()
     assert engine.has_unfinished_requests is True
 
 
@@ -126,7 +123,7 @@ def test_duplicate_request_id_is_rejected(
 def test_step_generates_one_token_per_running_sequence(
     engine: Engine,
 ) -> None:
-    """Generate one token for every running sequence in one engine step."""
+    """Schedule requests and generate one token for each selected sequence."""
     max_new_tokens = 8
 
     requests = [
@@ -145,15 +142,18 @@ def test_step_generates_one_token_per_running_sequence(
     for request in requests:
         engine.submit(request)
 
-    assert all(
-        sequence.num_generated_tokens == 0 for sequence in engine.running_sequences
-    )
+    assert engine.running_sequences == ()
+    assert len(engine.waiting_sequences) == 2
 
     engine.step()
+
+    assert len(engine.running_sequences) == 2
 
     assert all(
         sequence.num_generated_tokens == 1 for sequence in engine.running_sequences
     )
+
+    assert engine.waiting_sequences == ()
 
 
 def test_step_uses_one_batched_model_runner_call(
@@ -222,6 +222,80 @@ def test_step_without_active_sequence_skips_model_runner(
 
         assert finished == ()
         forward_mock.assert_not_called()
+
+
+def test_step_reserves_kv_for_non_terminal_generated_token() -> None:
+    """Grow KV storage before appending a non-terminal generated token."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=1,
+        max_batched_tokens=16,
+    )
+    model_runner = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        device="cpu",
+    )
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    request_id = "request-1"
+
+    engine.submit(
+        Request(
+            request_id=request_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=8,
+        ),
+    )
+
+    engine.step()
+
+    sequence = engine.running_sequences[0]
+
+    assert sequence.generated_token_ids == [5]
+    assert engine.scheduler.block_table.blocks_for_request(request_id) == (0, 1)
+    assert engine.scheduler.block_pool.num_allocated_blocks == 2
+
+
+def test_terminal_token_does_not_require_additional_kv_block() -> None:
+    """Finish successfully without reserving KV for a terminal token."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=1,
+        max_sequences=1,
+        max_batched_tokens=16,
+    )
+    model_runner = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        device="cpu",
+    )
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    engine.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=1,
+        ),
+    )
+
+    finished = engine.step()
+
+    assert len(finished) == 1
+    assert finished[0].finish_reason == FinishReason.LENGTH
+
+    assert engine.scheduler.block_pool.num_allocated_blocks == 0
+    assert engine.scheduler.block_pool.num_free_blocks == 1
 
 
 def test_sequence_finishes_on_eos(
@@ -313,25 +387,28 @@ def test_eos_takes_precedence_at_generation_limit(
     assert finished_sequence.finish_reason == FinishReason.EOS
 
 
-def test_finished_sequence_frees_capacity_for_waiting_request(
+def test_finished_sequence_frees_execution_capacity_for_waiting_request(
     engine: Engine,
 ) -> None:
-    """Admit the oldest waiting request when running capacity is released."""
+    """Schedule a waiting request after execution capacity is released."""
     max_new_tokens = 8
+    request_id1 = "request-1"
+    request_id2 = "request-2"
+    request_id3 = "request-3"
 
     requests = [
         Request(
-            request_id="request-1",
+            request_id=request_id1,
             prompt_token_ids=(1, 2),
             max_new_tokens=max_new_tokens,
         ),
         Request(
-            request_id="request-2",
+            request_id=request_id2,
             prompt_token_ids=(3, 4),
             max_new_tokens=max_new_tokens,
         ),
         Request(
-            request_id="request-3",
+            request_id=request_id3,
             prompt_token_ids=(5, 6),
             max_new_tokens=max_new_tokens,
         ),
@@ -340,26 +417,46 @@ def test_finished_sequence_frees_capacity_for_waiting_request(
     for request in requests:
         engine.submit(request)
 
-    assert [sequence.request.request_id for sequence in engine.running_sequences] == [
-        "request-1",
-        "request-2",
-    ]
+    assert engine.running_sequences == ()
+
     assert [sequence.request.request_id for sequence in engine.waiting_sequences] == [
-        "request-3"
+        request_id1,
+        request_id2,
+        request_id3,
     ]
 
     engine.step()
     engine.step()
     engine.step()
 
-    assert [sequence.request.request_id for sequence in engine.running_sequences] == [
-        "request-2",
-        "request-3",
+    # Mypy retains the earlier empty-tuple narrowing across engine.step().
+    running_request_ids = [  # type: ignore[var-annotated]
+        sequence.request.request_id for sequence in engine.running_sequences
     ]
-    assert not engine.waiting_sequences
+
+    assert running_request_ids == [request_id2]
+
+    assert [sequence.request.request_id for sequence in engine.waiting_sequences] == [
+        request_id3,
+    ]
 
     assert [sequence.request.request_id for sequence in engine.finished_sequences] == [
-        "request-1"
+        request_id1,
+    ]
+
+    engine.step()
+
+    # Mypy retains the earlier empty-tuple narrowing across engine.step().
+    running_request_ids = [  # type: ignore[var-annotated]
+        sequence.request.request_id for sequence in engine.running_sequences
+    ]
+
+    assert running_request_ids == [request_id2, request_id3]
+
+    assert engine.waiting_sequences == ()
+
+    assert [sequence.request.request_id for sequence in engine.finished_sequences] == [
+        request_id1,
     ]
 
 
@@ -441,3 +538,43 @@ def test_run_until_complete_finishes_all_requests(
         "request-2",
         "request-3",
     ]
+
+
+def test_run_until_complete_handles_requests_that_cannot_share_kv_capacity() -> None:
+    """Complete requests sequentially when KV capacity prevents co-residency."""
+    configuration = EngineConfiguration(
+        block_size=4,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=8,
+    )
+    model_runner = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        device="cpu",
+    )
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    for request_id in ("request-1", "request-2"):
+        engine.submit(
+            Request(
+                request_id=request_id,
+                prompt_token_ids=(1, 2, 3, 4, 5, 6, 7, 8),
+                max_new_tokens=1,
+            ),
+        )
+
+    finished = engine.run_until_complete()
+
+    assert [sequence.request.request_id for sequence in finished] == [
+        "request-1",
+        "request-2",
+    ]
+
+    assert engine.waiting_sequences == ()
+    assert engine.running_sequences == ()
+    assert engine.scheduler.block_pool.num_free_blocks == 2
