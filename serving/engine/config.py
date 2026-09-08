@@ -14,6 +14,7 @@ class EngineConfiguration:
         block_size: Number of token positions stored in one physical KV-cache block.
         num_blocks: Number of physical KV-cache blocks available to the engine.
         max_batched_tokens: Maximum number of tokens scheduled in one engine step.
+        seed: Seed used to initialize the sampling random-number generator.
     """
 
     device: str = "cpu"
@@ -22,14 +23,15 @@ class EngineConfiguration:
     block_size: int = 16
     num_blocks: int = 256
     max_batched_tokens: int = 2_048
+    seed: int = 0
 
     def __post_init__(self) -> None:
         """Validate engine configuration values.
 
         Raises:
             ValueError: If device is empty, max_sequences, block_size, num_blocks, or
-                max_batched_tokens are not positive, eos_token_id is negative, or
-                max_batched_tokens is smaller than max_sequences.
+                max_batched_tokens are not positive, eos_token_id or seed is negative,
+                or max_batched_tokens is smaller than max_sequences.
         """
         if not self.device.strip():
             raise ValueError("device must not be empty.")
@@ -53,3 +55,6 @@ class EngineConfiguration:
             raise ValueError(
                 "max_batched_tokens must be greater than or equal to max_sequences.",
             )
+
+        if self.seed < 0:
+            raise ValueError("seed must not be negative.")

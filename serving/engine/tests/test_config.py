@@ -15,6 +15,7 @@ def test_engine_configuration_defaults() -> None:
     assert configuration.block_size == 16
     assert configuration.num_blocks == 256
     assert configuration.max_batched_tokens == 2_048
+    assert configuration.seed == 0
 
 
 def test_engine_configuration_explicit_values() -> None:
@@ -26,6 +27,7 @@ def test_engine_configuration_explicit_values() -> None:
         block_size=32,
         num_blocks=512,
         max_batched_tokens=4_096,
+        seed=42,
     )
 
     assert configuration.device == "cuda"
@@ -34,6 +36,7 @@ def test_engine_configuration_explicit_values() -> None:
     assert configuration.block_size == 32
     assert configuration.num_blocks == 512
     assert configuration.max_batched_tokens == 4_096
+    assert configuration.seed == 42
 
 
 @pytest.mark.parametrize(
@@ -149,3 +152,16 @@ def test_max_batched_tokens_equal_to_max_sequences_is_valid() -> None:
     )
 
     assert configuration.max_batched_tokens == configuration.max_sequences
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [
+        -42,
+        -1,
+    ],
+)
+def test_negative_seed_is_rejected(seed: int) -> None:
+    """Reject negative sampling random-number-generator seeds."""
+    with pytest.raises(ValueError, match="seed must not be negative"):
+        EngineConfiguration(seed=seed)

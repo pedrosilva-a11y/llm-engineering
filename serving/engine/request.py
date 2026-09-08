@@ -1,6 +1,8 @@
 """Request models for the LLM inference engine."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from serving.engine.sampling import SamplingParameters
 
 
 @dataclass(frozen=True)
@@ -13,12 +15,16 @@ class Request:
         max_new_tokens: Maximum number of tokens generated after the prompt,
             including EOS if EOS is generated.
         arrival_time: Request arrival timestamp used for ordering metrics.
+        sampling_parameters: Token-selection configuration used during generation.
     """
 
     request_id: str
     prompt_token_ids: tuple[int, ...]
     max_new_tokens: int
     arrival_time: float = 0.0
+    sampling_parameters: SamplingParameters = field(
+        default_factory=SamplingParameters,
+    )
 
     def __post_init__(self) -> None:
         """Validate request values.

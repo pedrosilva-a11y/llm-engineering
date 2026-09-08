@@ -1,14 +1,17 @@
 """Tests for the LLM inference engine."""
 
+from collections.abc import Sequence
 from unittest.mock import patch
 
 import pytest
+import torch
 
 from serving.engine.config import EngineConfiguration
 from serving.engine.engine import Engine
 from serving.engine.model_runner import DeterministicStubModelRunner
 from serving.engine.request import Request
-from serving.engine.sequence import FinishReason, SequenceStatus
+from serving.engine.sampling import SamplingParameters
+from serving.engine.sequence import FinishReason, SequenceState, SequenceStatus
 
 
 @pytest.fixture
@@ -35,6 +38,18 @@ def model_runner() -> DeterministicStubModelRunner:
         },
         device="cpu",
     )
+
+
+class FixedLogitsModelRunner:
+    """Return the same finite vocabulary logits for every sequence."""
+
+    def __init__(self, logits: torch.Tensor) -> None:
+        """Initialize the runner with fixed vocabulary logits."""
+        self._logits = logits
+
+    def forward(self, sequences: Sequence[SequenceState]) -> torch.Tensor:
+        """Return fixed logits for every sequence in the batch."""
+        return self._logits.unsqueeze(0).repeat(len(sequences), 1)
 
 
 @pytest.fixture
@@ -154,6 +169,100 @@ def test_step_generates_one_token_per_running_sequence(
     )
 
     assert engine.waiting_sequences == ()
+
+
+def test_step_uses_per_request_sampling_parameters(engine: Engine) -> None:
+    """Use each request's sampling parameters during token selection."""
+    first_parameters = SamplingParameters(greedy=True)
+    second_parameters = SamplingParameters(
+        temperature=0.8,
+        top_k=5,
+        top_p=0.9,
+        greedy=False,
+    )
+    max_new_tokens = 8
+
+    engine.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2),
+            max_new_tokens=max_new_tokens,
+            sampling_parameters=first_parameters,
+        ),
+    )
+    engine.submit(
+        Request(
+            request_id="request-2",
+            prompt_token_ids=(3, 4),
+            max_new_tokens=max_new_tokens,
+            sampling_parameters=second_parameters,
+        ),
+    )
+
+    with patch.object(
+        engine.sampler,
+        "sample_token",
+        wraps=engine.sampler.sample_token,
+    ) as sample_mock:
+        engine.step()
+
+    assert sample_mock.call_count == 2
+    assert sample_mock.call_args_list[0].kwargs["parameters"] == first_parameters
+    assert sample_mock.call_args_list[1].kwargs["parameters"] == second_parameters
+
+
+def test_engines_with_same_seed_produce_same_sampled_tokens() -> None:
+    """Produce the same sampled sequence from engines with the same seed."""
+    seed = 42
+    request_id = "request-1"
+    prompt_token_ids = (1,)
+    max_new_tokens = 8
+
+    configuration = EngineConfiguration(
+        max_sequences=1,
+        eos_token_id=4,
+        seed=seed,
+    )
+
+    logits = torch.log(torch.tensor([0.40, 0.30, 0.20, 0.10, 1e-9]))
+
+    first_engine = Engine(
+        configuration=configuration,
+        model_runner=FixedLogitsModelRunner(logits),
+    )
+    second_engine = Engine(
+        configuration=configuration,
+        model_runner=FixedLogitsModelRunner(logits),
+    )
+
+    parameters = SamplingParameters(
+        top_k=4,
+        greedy=False,
+    )
+
+    first_engine.submit(
+        Request(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            sampling_parameters=parameters,
+        ),
+    )
+    second_engine.submit(
+        Request(
+            request_id=request_id,
+            prompt_token_ids=prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            sampling_parameters=parameters,
+        ),
+    )
+
+    first_finished = first_engine.run_until_complete()
+    second_finished = second_engine.run_until_complete()
+
+    assert first_finished[0].generated_token_ids == (
+        second_finished[0].generated_token_ids
+    )
 
 
 def test_step_uses_one_batched_model_runner_call(
@@ -336,14 +445,22 @@ def test_step_discards_output_for_sequence_preempted_during_same_batch() -> None
         ),
     )
 
-    with patch.object(
-        model_runner,
-        "forward",
-        wraps=model_runner.forward,
-    ) as forward_mock:
+    with (
+        patch.object(
+            model_runner,
+            "forward",
+            wraps=model_runner.forward,
+        ) as forward_mock,
+        patch.object(
+            engine.sampler,
+            "sample_token",
+            wraps=engine.sampler.sample_token,
+        ) as sample_mock,
+    ):
         finished = engine.step()
 
         forward_mock.assert_called_once()
+        sample_mock.assert_called_once()
 
     assert finished == ()
 

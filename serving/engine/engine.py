@@ -1,8 +1,11 @@
 """Core generation loop for the LLM inference engine."""
 
+import torch
+
 from serving.engine.config import EngineConfiguration
 from serving.engine.model_runner import ModelRunner
 from serving.engine.request import Request
+from serving.engine.sampling import Sampler
 from serving.engine.scheduler import Scheduler
 from serving.engine.sequence import FinishReason, SequenceState, SequenceStatus
 
@@ -32,6 +35,13 @@ class Engine:
         """
         self.configuration = configuration
         self.model_runner = model_runner
+
+        generator = torch.Generator(
+            device=configuration.device,
+        ).manual_seed(configuration.seed)
+
+        self.sampler = Sampler(generator=generator)
+
         self.scheduler = Scheduler(configuration=configuration)
 
     @property
@@ -115,7 +125,10 @@ class Engine:
             if sequence.status == SequenceStatus.PREEMPTED:
                 continue
 
-            token_id = int(logits[index].argmax().item())
+            token_id = self.sampler.sample_token(
+                logits=logits[index],
+                parameters=sequence.request.sampling_parameters,
+            )
 
             finishes_with_eos = token_id == self.configuration.eos_token_id
             finishes_with_length = (
