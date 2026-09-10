@@ -135,6 +135,7 @@ def test_waiting_sequence_cannot_be_marked_preempted(
     [
         FinishReason.EOS,
         FinishReason.LENGTH,
+        FinishReason.CANCELLED,
     ],
 )
 def test_mark_finished(

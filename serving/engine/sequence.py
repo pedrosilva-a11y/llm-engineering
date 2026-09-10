@@ -20,6 +20,7 @@ class FinishReason(StrEnum):
 
     EOS = "eos"
     LENGTH = "length"
+    CANCELLED = "cancelled"
 
 
 @dataclass

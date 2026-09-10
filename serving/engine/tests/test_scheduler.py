@@ -89,13 +89,11 @@ def test_submit_adds_request_to_waiting_queue(
         max_new_tokens=8,
     )
 
-    scheduler.submit(request)
+    sequence = scheduler.submit(request)
 
-    assert len(scheduler.waiting_sequences) == 1
+    assert scheduler.waiting_sequences == (sequence,)
     assert scheduler.running_sequences == ()
     assert scheduler.finished_sequences == ()
-
-    sequence = scheduler.waiting_sequences[0]
 
     assert sequence.request is request
     assert sequence.status == SequenceStatus.WAITING
@@ -323,6 +321,135 @@ def test_submit_excludes_terminal_token_from_maximum_kv_requirement() -> None:
     assert len(scheduler.waiting_sequences) == 1
     assert scheduler.waiting_sequences[0].request is request
     assert scheduler.block_pool.num_allocated_blocks == 0
+
+
+# Cancellation
+
+
+def test_cancel_waiting_sequence_moves_it_to_finished(
+    scheduler: Scheduler,
+) -> None:
+    """Cancel a waiting request without allocating KV-cache blocks."""
+    sequence = scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2, 3),
+            max_new_tokens=8,
+        ),
+    )
+
+    cancelled = scheduler.cancel("request-1")
+
+    assert cancelled is True
+    assert not scheduler.waiting_sequences
+    assert not scheduler.running_sequences
+    assert scheduler.finished_sequences == (sequence,)
+
+    assert sequence.status == SequenceStatus.FINISHED
+    assert sequence.finish_reason == FinishReason.CANCELLED
+    assert scheduler.has_unfinished_requests is False
+
+    assert scheduler.block_pool.num_allocated_blocks == 0
+
+    assert_scheduler_invariant(scheduler)
+
+
+def test_cancel_running_sequence_releases_kv_blocks(
+    scheduler: Scheduler,
+) -> None:
+    """Release KV-cache ownership when cancelling a running request."""
+    sequence = scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=tuple(range(17)),
+            max_new_tokens=8,
+        ),
+    )
+
+    scheduler._admit_waiting_sequences()
+
+    assert scheduler.running_sequences == (sequence,)
+    assert scheduler.block_pool.num_allocated_blocks == 2
+
+    cancelled = scheduler.cancel("request-1")
+
+    assert cancelled is True
+    assert not scheduler.running_sequences
+    assert scheduler.finished_sequences == (sequence,)
+
+    assert sequence.status == SequenceStatus.FINISHED
+    assert sequence.finish_reason == FinishReason.CANCELLED
+
+    assert scheduler.block_pool.num_allocated_blocks == 0
+    assert scheduler.block_pool.num_free_blocks == 4
+
+    with pytest.raises(ValueError, match="Unknown request_id"):
+        scheduler.block_table.blocks_for_request("request-1")
+
+    assert_scheduler_invariant(scheduler)
+
+
+def test_cancel_preempted_sequence_removes_it_from_waiting(
+    scheduler: Scheduler,
+) -> None:
+    """Cancel a preempted request without attempting to release KV twice."""
+    sequence = scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2, 3),
+            max_new_tokens=8,
+        ),
+    )
+
+    scheduler._admit_waiting_sequences()
+    scheduler._preempt_sequence(sequence)
+
+    assert sequence.status == SequenceStatus.PREEMPTED
+    assert scheduler.waiting_sequences == (sequence,)
+    assert scheduler.block_pool.num_allocated_blocks == 0
+
+    cancelled = scheduler.cancel("request-1")
+
+    assert cancelled is True
+    assert not scheduler.waiting_sequences
+    assert scheduler.finished_sequences == (sequence,)
+
+    cancelled_sequence = scheduler.finished_sequences[0]
+
+    assert cancelled_sequence is sequence
+    assert cancelled_sequence.status == SequenceStatus.FINISHED
+    assert cancelled_sequence.finish_reason == FinishReason.CANCELLED
+
+    assert scheduler.block_pool.num_allocated_blocks == 0
+
+    assert_scheduler_invariant(scheduler)
+
+
+def test_cancel_returns_false_when_request_is_not_unfinished(
+    scheduler: Scheduler,
+) -> None:
+    """Return false when cancellation cannot affect an unfinished request."""
+    assert scheduler.cancel("unknown-request") is False
+
+    sequence = scheduler.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1,),
+            max_new_tokens=8,
+        ),
+    )
+
+    scheduler._admit_waiting_sequences()
+    scheduler.finish_sequence(
+        sequence=sequence,
+        reason=FinishReason.LENGTH,
+    )
+
+    assert scheduler.cancel("request-1") is False
+    assert scheduler.finished_sequences == (sequence,)
+    assert sequence.finish_reason == FinishReason.LENGTH
+
+    assert_scheduler_invariant(scheduler)
 
 
 # Admission

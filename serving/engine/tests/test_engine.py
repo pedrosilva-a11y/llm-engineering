@@ -91,10 +91,10 @@ def test_submit_keeps_requests_waiting_until_scheduled(
         ),
     ]
 
-    for request in requests:
-        engine.submit(request)
+    submitted_sequences = tuple(engine.submit(request) for request in requests)
 
     assert engine.running_sequences == ()
+    assert engine.waiting_sequences == submitted_sequences
 
     assert [sequence.request.request_id for sequence in engine.waiting_sequences] == [
         request_id1,
@@ -133,6 +133,30 @@ def test_duplicate_request_id_is_rejected(
 
     with pytest.raises(ValueError, match="has already been submitted"):
         engine.submit(duplicate_request)
+
+
+def test_cancel_unfinished_request(
+    engine: Engine,
+) -> None:
+    """Cancel an unfinished request through the engine facade."""
+    sequence = engine.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2),
+            max_new_tokens=8,
+        ),
+    )
+
+    cancelled = engine.cancel("request-1")
+
+    assert cancelled is True
+    assert not engine.waiting_sequences
+    assert not engine.running_sequences
+    assert engine.finished_sequences == (sequence,)
+    assert engine.has_unfinished_requests is False
+
+    assert sequence.status == SequenceStatus.FINISHED
+    assert sequence.finish_reason == FinishReason.CANCELLED
 
 
 def test_step_generates_one_token_per_running_sequence(

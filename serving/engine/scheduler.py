@@ -78,7 +78,7 @@ class Scheduler:
         """Return whether waiting or running requests remain."""
         return bool(self._waiting or self._running)
 
-    def submit(self, request: Request) -> None:
+    def submit(self, request: Request) -> SequenceState:
         """Add a generation request to the waiting queue.
 
         Requests that can never be scheduled are rejected immediately rather
@@ -86,6 +86,9 @@ class Scheduler:
 
         Args:
             request: Immutable generation request to submit.
+
+        Returns:
+            Sequence submitted to the waiting queue.
 
         Raises:
             ValueError: If the request identifier is already known, the prompt
@@ -125,7 +128,52 @@ class Scheduler:
                 "than the scheduler owns."
             )
 
-        self._waiting.append(SequenceState(request=request))
+        sequence = SequenceState(request=request)
+        self._waiting.append(sequence)
+
+        return sequence
+
+    def cancel(self, request_id: str) -> bool:
+        """Cancel an unfinished request and release owned resources.
+
+        Args:
+            request_id: Request identifier to cancel.
+
+        Returns:
+            True when an unfinished request was cancelled, otherwise False.
+        """
+        waiting_sequence = next(
+            (
+                sequence
+                for sequence in self._waiting
+                if sequence.request.request_id == request_id
+            ),
+            None,
+        )
+
+        if waiting_sequence is not None:
+            self._waiting.remove(waiting_sequence)
+            waiting_sequence.mark_finished(FinishReason.CANCELLED)
+            self._finished.append(waiting_sequence)
+            return True
+
+        running_sequence = next(
+            (
+                sequence
+                for sequence in self._running
+                if sequence.request.request_id == request_id
+            ),
+            None,
+        )
+
+        if running_sequence is None:
+            return False
+
+        self._release_sequence_resources(running_sequence)
+        running_sequence.mark_finished(FinishReason.CANCELLED)
+        self._finished.append(running_sequence)
+
+        return True
 
     def _blocks_required_for_sequence(
         self,

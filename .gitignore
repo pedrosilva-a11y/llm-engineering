@@ -12,3 +12,6 @@
 # Python cache and bytecode
 __pycache__/
 *.pyc
+
+# Metrics result
+benchmark_results/

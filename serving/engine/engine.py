@@ -80,13 +80,27 @@ class Engine:
         """
         return self.scheduler.has_unfinished_requests
 
-    def submit(self, request: Request) -> None:
+    def submit(self, request: Request) -> SequenceState:
         """Submit one generation request to the scheduler.
 
         Args:
             request: Immutable generation request to submit.
+
+        Returns:
+            Sequence state created for the submitted request.
         """
-        self.scheduler.submit(request=request)
+        return self.scheduler.submit(request=request)
+
+    def cancel(self, request_id: str) -> bool:
+        """Cancel an unfinished generation request.
+
+        Args:
+            request_id: Identifier of the request to cancel.
+
+        Returns:
+            True when an unfinished request was cancelled, otherwise False.
+        """
+        return self.scheduler.cancel(request_id)
 
     def step(self) -> tuple[SequenceState, ...]:
         """Advance scheduled sequences by one inference-engine step.
@@ -157,10 +171,10 @@ class Engine:
         return tuple(finished_this_step)
 
     def run_until_complete(self) -> tuple[SequenceState, ...]:
-        """Run decoding steps until all submitted requests have completed.
+        """Run decoding steps until all submitted requests reach a terminal state.
 
         Returns:
-            All finished sequences in completion order.
+            All terminal sequences in completion order.
         """
         while self.has_unfinished_requests:
             self.step()
