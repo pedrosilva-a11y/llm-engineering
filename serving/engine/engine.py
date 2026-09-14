@@ -3,6 +3,7 @@
 import torch
 
 from serving.engine.config import EngineConfiguration
+from serving.engine.execution import ExecutionPhase, ModelExecution
 from serving.engine.model_runner import ModelRunner
 from serving.engine.request import Request
 from serving.engine.sampling import Sampler
@@ -102,6 +103,35 @@ class Engine:
         """
         return self.scheduler.cancel(request_id)
 
+    def _build_model_execution(
+        self,
+        sequence: SequenceState,
+        phase: ExecutionPhase,
+    ) -> ModelExecution:
+        """Build model-execution metadata for a scheduled sequence.
+
+        Args:
+            sequence: Scheduled sequence whose current logical history will be executed.
+            phase: Execution phase selected by the scheduler.
+
+        Returns:
+            Model execution descriptor containing the sequence, execution phase, and
+            physical KV-cache slots for every token in the current sequence history.
+        """
+        slot_ids = tuple(
+            self.scheduler.block_table.slot_for_position(
+                request_id=sequence.request.request_id,
+                token_position=position,
+            )
+            for position in range(sequence.current_length)
+        )
+
+        return ModelExecution(
+            sequence=sequence,
+            phase=phase,
+            slot_ids=slot_ids,
+        )
+
     def step(self) -> tuple[SequenceState, ...]:
         """Advance scheduled sequences by one inference-engine step.
 
@@ -123,19 +153,33 @@ class Engine:
         """
         scheduler_output = self.scheduler.schedule()
 
-        batch = (
-            *scheduler_output.decode_sequences,
-            *scheduler_output.prefill_sequences,
+        executions = (
+            *(
+                self._build_model_execution(
+                    sequence=sequence,
+                    phase=ExecutionPhase.DECODE,
+                )
+                for sequence in scheduler_output.decode_sequences
+            ),
+            *(
+                self._build_model_execution(
+                    sequence=sequence,
+                    phase=ExecutionPhase.PREFILL,
+                )
+                for sequence in scheduler_output.prefill_sequences
+            ),
         )
 
-        if not batch:
+        if not executions:
             return ()
 
-        logits = self.model_runner.forward(batch)
+        logits = self.model_runner.forward(executions)
 
         finished_this_step: list[SequenceState] = []
 
-        for index, sequence in enumerate(batch):
+        for index, execution in enumerate(executions):
+            sequence = execution.sequence
+
             if sequence.status == SequenceStatus.PREEMPTED:
                 continue
 

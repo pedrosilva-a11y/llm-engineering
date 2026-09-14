@@ -6,7 +6,7 @@ from typing import Any, cast
 import torch
 from transformers import PreTrainedModel
 
-from serving.engine.sequence import SequenceState
+from serving.engine.execution import ModelExecution
 
 
 class NaiveModelRunner:
@@ -28,25 +28,27 @@ class NaiveModelRunner:
         self._device = device
         cast(torch.nn.Module, self._model).eval()
 
-    def forward(self, sequences: Sequence[SequenceState]) -> torch.Tensor:
-        """Return next-token logits for each sequence.
+    def forward(self, executions: Sequence[ModelExecution]) -> torch.Tensor:
+        """Return next-token logits for each model execution.
 
         Args:
-            sequences: Sequence states to evaluate.
+            executions: Scheduled model executions to evaluate.
 
         Returns:
             Next-token logits with shape ``(batch_size, vocab_size)``.
 
         Raises:
-            ValueError: If no sequences are provided.
+            ValueError: If no executions are provided.
         """
-        if not sequences:
-            raise ValueError("At least one sequence is required.")
+        if not executions:
+            raise ValueError("At least one execution is required.")
 
         batch_logits: list[torch.Tensor] = []
 
         with torch.inference_mode():
-            for sequence in sequences:
+            for execution in executions:
+                sequence = execution.sequence
+
                 input_ids = torch.tensor(
                     sequence.all_token_ids,
                     dtype=torch.long,

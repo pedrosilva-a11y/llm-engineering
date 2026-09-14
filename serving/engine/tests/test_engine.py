@@ -8,10 +8,11 @@ import torch
 
 from serving.engine.config import EngineConfiguration
 from serving.engine.engine import Engine
+from serving.engine.execution import ExecutionPhase, ModelExecution
 from serving.engine.model_runner import DeterministicStubModelRunner
 from serving.engine.request import Request
 from serving.engine.sampling import SamplingParameters
-from serving.engine.sequence import FinishReason, SequenceState, SequenceStatus
+from serving.engine.sequence import FinishReason, SequenceStatus
 
 
 @pytest.fixture
@@ -41,15 +42,34 @@ def model_runner() -> DeterministicStubModelRunner:
 
 
 class FixedLogitsModelRunner:
-    """Return the same finite vocabulary logits for every sequence."""
+    """Return the same finite vocabulary logits for every execution."""
 
     def __init__(self, logits: torch.Tensor) -> None:
         """Initialize the runner with fixed vocabulary logits."""
         self._logits = logits
 
-    def forward(self, sequences: Sequence[SequenceState]) -> torch.Tensor:
-        """Return fixed logits for every sequence in the batch."""
-        return self._logits.unsqueeze(0).repeat(len(sequences), 1)
+    def forward(self, executions: Sequence[ModelExecution]) -> torch.Tensor:
+        """Return fixed logits for every execution in the batch."""
+        return self._logits.unsqueeze(0).repeat(len(executions), 1)
+
+
+class RecordingModelRunner:
+    """Record model executions while delegating logits generation."""
+
+    def __init__(self, delegate: DeterministicStubModelRunner) -> None:
+        """Initialize the runner with a deterministic delegate."""
+        self._delegate = delegate
+        self.calls: list[tuple[ModelExecution, ...]] = []
+        self.generated_token_counts: list[tuple[int, ...]] = []
+
+    def forward(self, executions: Sequence[ModelExecution]) -> torch.Tensor:
+        """Record execution metadata and return delegated logits."""
+        self.calls.append(tuple(executions))
+        self.generated_token_counts.append(
+            tuple(execution.sequence.num_generated_tokens for execution in executions)
+        )
+
+        return self._delegate.forward(executions)
 
 
 @pytest.fixture
@@ -332,6 +352,119 @@ def test_step_uses_one_batched_model_runner_call(
         forward_mock.assert_called_once()
 
 
+def test_step_builds_prefill_then_decode_execution_metadata() -> None:
+    """Build prefill metadata first and decode metadata on the next step."""
+    configuration = EngineConfiguration(
+        device="cpu",
+        block_size=4,
+        num_blocks=4,
+        max_sequences=1,
+        max_batched_tokens=8,
+        eos_token_id=0,
+    )
+    delegate = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        default_eos_after=8,
+    )
+    model_runner = RecordingModelRunner(delegate)
+    engine = Engine(configuration=configuration, model_runner=model_runner)
+
+    request_id = "request-1"
+    sequence = engine.submit(
+        Request(
+            request_id=request_id,
+            prompt_token_ids=(1, 2, 3),
+            max_new_tokens=4,
+        ),
+    )
+
+    engine.step()
+
+    prefill_execution = model_runner.calls[0][0]
+
+    assert prefill_execution.sequence is sequence
+    assert prefill_execution.phase is ExecutionPhase.PREFILL
+    assert model_runner.generated_token_counts[0] == (0,)
+
+    assert prefill_execution.slot_ids == tuple(
+        engine.scheduler.block_table.slot_for_position(
+            request_id=request_id, token_position=position
+        )
+        for position in range(len(prefill_execution.slot_ids))
+    )
+
+    engine.step()
+
+    decode_execution = model_runner.calls[1][0]
+
+    assert decode_execution.sequence is sequence
+    assert decode_execution.phase is ExecutionPhase.DECODE
+    assert model_runner.generated_token_counts[1] == (1,)
+
+    assert decode_execution.slot_ids == tuple(
+        engine.scheduler.block_table.slot_for_position(
+            request_id=request_id,
+            token_position=position,
+        )
+        for position in range(len(decode_execution.slot_ids))
+    )
+
+
+def test_step_preserves_decode_and_prefill_phases_in_the_same_batch() -> None:
+    """Preserve execution phases when decode and prefill share one batch."""
+    configuration = EngineConfiguration(
+        device="cpu",
+        block_size=4,
+        num_blocks=4,
+        max_sequences=2,
+        max_batched_tokens=8,
+        eos_token_id=0,
+    )
+    delegate = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        default_eos_after=8,
+    )
+    model_runner = RecordingModelRunner(delegate)
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    first_sequence = engine.submit(
+        Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2),
+            max_new_tokens=4,
+        )
+    )
+
+    engine.step()
+
+    second_sequence = engine.submit(
+        Request(
+            request_id="request-2",
+            prompt_token_ids=(3, 4),
+            max_new_tokens=4,
+        )
+    )
+
+    engine.step()
+
+    executions = model_runner.calls[1]
+
+    assert len(executions) == 2
+
+    assert executions[0].sequence is first_sequence
+    assert executions[0].phase is ExecutionPhase.DECODE
+
+    assert executions[1].sequence is second_sequence
+    assert executions[1].phase is ExecutionPhase.PREFILL
+
+
 def test_step_without_active_sequence_skips_model_runner(
     configuration: EngineConfiguration,
 ) -> None:
@@ -582,6 +715,64 @@ def test_preempted_sequence_is_reprefilled_on_later_engine_step() -> None:
     assert engine.running_sequences[0].generated_token_ids == [5]
 
     assert engine.scheduler.block_table.blocks_for_request(victim_id) == (0, 1)
+
+
+def test_reprefill_phase_is_explicit_with_generated_history() -> None:
+    """Use prefill after preemption even when generated history already exists."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=2,
+        max_batched_tokens=32,
+        eos_token_id=0,
+    )
+    delegate = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+        default_eos_after=8,
+    )
+    model_runner = RecordingModelRunner(delegate)
+    engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    engine.submit(
+        Request(
+            request_id="requester",
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+        )
+    )
+    victim = engine.submit(
+        Request(
+            request_id="victim",
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=3,
+        )
+    )
+
+    engine.step()
+
+    assert victim.status is SequenceStatus.PREEMPTED
+
+    victim.append_token(5)
+
+    assert victim.num_generated_tokens == 1
+
+    # Finish the requester and release its KV blocks.
+    engine.step()
+
+    # Re-admit the victim. Despite generated history, this must be PREFILL.
+    engine.step()
+
+    execution = model_runner.calls[-1][0]
+
+    assert execution.sequence is victim
+    assert execution.phase is ExecutionPhase.PREFILL
+    assert model_runner.generated_token_counts[-1] == (1,)
+    assert len(execution.slot_ids) == 17
 
 
 def test_sequence_finishes_on_eos(

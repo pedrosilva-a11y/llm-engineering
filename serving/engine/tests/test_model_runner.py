@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from serving.engine.execution import ExecutionPhase, ModelExecution
 from serving.engine.model_runner import (
     DeterministicStubModelRunner,
     ModelRunner,
@@ -11,8 +12,20 @@ from serving.engine.request import Request
 from serving.engine.sequence import SequenceState
 
 
+def make_execution(
+    sequence: SequenceState,
+    phase: ExecutionPhase = ExecutionPhase.PREFILL,
+) -> ModelExecution:
+    """Create model execution metadata for a sequence."""
+    return ModelExecution(
+        sequence=sequence,
+        phase=phase,
+        slot_ids=tuple(range(sequence.current_length)),
+    )
+
+
 def test_deterministic_stub_model_runner_forward() -> None:
-    """Produce deterministic next-token logits for a sequence batch."""
+    """Produce deterministic next-token logits for an execution batch."""
     runner = DeterministicStubModelRunner(
         vocab_size=10,
         eos_token_id=0,
@@ -20,28 +33,64 @@ def test_deterministic_stub_model_runner_forward() -> None:
         device="cpu",
     )
 
-    sequences = [
-        SequenceState(
-            request=Request(
-                request_id="request-1",
-                prompt_token_ids=(1, 2, 3),
-                max_new_tokens=4,
-            ),
+    first_sequence = SequenceState(
+        request=Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2, 3),
+            max_new_tokens=4,
         ),
-        SequenceState(
-            request=Request(
-                request_id="request-2",
-                prompt_token_ids=(4, 5, 6),
-                max_new_tokens=4,
-            ),
+    )
+    second_sequence = SequenceState(
+        request=Request(
+            request_id="request-2",
+            prompt_token_ids=(4, 5, 6),
+            max_new_tokens=4,
         ),
+    )
+
+    executions = [
+        make_execution(first_sequence),
+        make_execution(second_sequence),
     ]
 
-    logits = runner.forward(sequences)
+    logits = runner.forward(executions)
 
     assert logits.shape == (2, 10)
     assert logits.device == torch.device("cpu")
     assert torch.argmax(logits, dim=1).tolist() == [5, 5]
+
+
+def test_deterministic_stub_is_independent_of_execution_metadata() -> None:
+    """Ignore phase and physical KV-slot placement when producing logits."""
+    runner = DeterministicStubModelRunner(
+        vocab_size=10,
+        eos_token_id=0,
+        generated_token_id=5,
+    )
+
+    sequence = SequenceState(
+        request=Request(
+            request_id="request-1",
+            prompt_token_ids=(1, 2, 3),
+            max_new_tokens=4,
+        ),
+    )
+
+    prefill_execution = ModelExecution(
+        sequence=sequence,
+        phase=ExecutionPhase.PREFILL,
+        slot_ids=(0, 1, 2),
+    )
+    decode_execution = ModelExecution(
+        sequence=sequence,
+        phase=ExecutionPhase.DECODE,
+        slot_ids=(16, 32, 48),
+    )
+
+    prefill_logits = runner.forward((prefill_execution,))
+    decode_logits = runner.forward((decode_execution,))
+
+    torch.testing.assert_close(prefill_logits, decode_logits)
 
 
 def test_deterministic_stub_model_runner_eos_thresholds() -> None:
@@ -83,9 +132,9 @@ def test_deterministic_stub_model_runner_eos_thresholds() -> None:
 
     logits = runner.forward(
         [
-            first_sequence,
-            second_sequence,
-            third_sequence,
+            make_execution(first_sequence, ExecutionPhase.DECODE),
+            make_execution(second_sequence, ExecutionPhase.DECODE),
+            make_execution(third_sequence, ExecutionPhase.DECODE),
         ]
     )
 
@@ -219,13 +268,13 @@ def test_non_positive_request_eos_threshold_is_rejected(
         )
 
 
-def test_empty_sequence_batch_is_rejected() -> None:
-    """Reject model execution without active sequences."""
+def test_empty_execution_batch_is_rejected() -> None:
+    """Reject model execution without scheduled executions."""
     runner = DeterministicStubModelRunner(
         vocab_size=10,
         eos_token_id=0,
         generated_token_id=5,
     )
 
-    with pytest.raises(ValueError, match="sequences must not be empty"):
+    with pytest.raises(ValueError, match="executions must not be empty"):
         runner.forward([])

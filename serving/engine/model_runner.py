@@ -5,7 +5,7 @@ from typing import Protocol
 
 import torch
 
-from serving.engine.sequence import SequenceState
+from serving.engine.execution import ModelExecution
 
 
 class ModelRunner(Protocol):
@@ -13,12 +13,12 @@ class ModelRunner(Protocol):
 
     def forward(
         self,
-        sequences: Sequence[SequenceState],
+        executions: Sequence[ModelExecution],
     ) -> torch.Tensor:
-        """Return next-token logits for a batch of sequences.
+        """Return next-token logits for a batch of model executions.
 
         Args:
-            sequences: Active generation sequences to process.
+            executions: Scheduled model executions to process.
 
         Returns:
             Logits with shape ``(batch_size, vocab_size)``.
@@ -87,29 +87,31 @@ class DeterministicStubModelRunner:
 
     def forward(
         self,
-        sequences: Sequence[SequenceState],
+        executions: Sequence[ModelExecution],
     ) -> torch.Tensor:
-        """Produce deterministic next-token logits for a sequence batch.
+        """Produce deterministic next-token logits for an execution batch.
 
         Args:
-            sequences: Active generation sequences to process.
+            executions: Scheduled model executions to process.
 
         Returns:
             Logits with shape ``(batch_size, vocab_size)``.
 
         Raises:
-            ValueError: If the sequence batch is empty.
+            ValueError: If the execution batch is empty.
         """
-        if not sequences:
-            raise ValueError("sequences must not be empty.")
+        if not executions:
+            raise ValueError("executions must not be empty.")
 
         logits = torch.full(
-            (len(sequences), self.vocab_size),
+            (len(executions), self.vocab_size),
             fill_value=float("-inf"),
             device=self.device,
         )
 
-        for index, sequence in enumerate(sequences):
+        for index, execution in enumerate(executions):
+            sequence = execution.sequence
+
             eos_after = self.eos_after_by_request.get(
                 sequence.request.request_id,
                 self.default_eos_after,
