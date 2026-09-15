@@ -1,6 +1,7 @@
 """Reconcile analytical and observed GPU memory for the Day 8 KV cache."""
 
 import gc
+from typing import cast
 
 import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel
@@ -30,8 +31,7 @@ def mib(num_bytes: int) -> float:
 def parameter_bytes(model: PreTrainedModel) -> int:
     """Return the total bytes occupied by model parameters."""
     return sum(
-        parameter.numel() * parameter.element_size()
-        for parameter in model.parameters()
+        parameter.numel() * parameter.element_size() for parameter in model.parameters()
     )
 
 
@@ -62,8 +62,10 @@ def main() -> None:
         revision=MODEL_REVISION,
         dtype=DTYPE,
     )
-    model.to(device)
-    model.eval()
+
+    model_module = cast(torch.nn.Module, model)
+    model_module.to(device)
+    model_module.eval()
 
     torch.cuda.synchronize()
 
@@ -81,19 +83,11 @@ def main() -> None:
     if head_dim_config is not None:
         head_dim = int(head_dim_config)
     else:
-        head_dim = int(
-            model.config.hidden_size // model.config.num_attention_heads
-        )
+        head_dim = int(model.config.hidden_size // model.config.num_attention_heads)
 
     dtype_bytes = torch.empty((), dtype=DTYPE).element_size()
 
-    kv_bytes_per_token = (
-        2
-        * num_layers
-        * num_kv_heads
-        * head_dim
-        * dtype_bytes
-    )
+    kv_bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
     kv_block_bytes = kv_bytes_per_token * BLOCK_SIZE
 
     target_used_bytes = int(total_memory * TARGET_GPU_UTILIZATION)
@@ -130,34 +124,16 @@ def main() -> None:
         f"KV bytes/token: {kv_bytes_per_token:,} "
         f"({kv_bytes_per_token / _BYTES_PER_KIB:.2f} KiB)"
     )
-    print(
-        f"KV bytes/block: {kv_block_bytes:,} "
-        f"({mib(kv_block_bytes):.4f} MiB)"
-    )
+    print(f"KV bytes/block: {kv_block_bytes:,} ({mib(kv_block_bytes):.4f} MiB)")
 
     print()
     print("=== Prospective KV capacity ===")
-    print(
-        f"Target GPU utilization: "
-        f"{TARGET_GPU_UTILIZATION:.0%}"
-    )
-    print(
-        f"Target used memory: "
-        f"{gib(target_used_bytes):.2f} GiB"
-    )
-    print(
-        f"Currently used memory: "
-        f"{gib(currently_used_bytes):.2f} GiB"
-    )
-    print(
-        f"KV budget: "
-        f"{gib(kv_budget_bytes):.2f} GiB"
-    )
+    print(f"Target GPU utilization: {TARGET_GPU_UTILIZATION:.0%}")
+    print(f"Target used memory: {gib(target_used_bytes):.2f} GiB")
+    print(f"Currently used memory: {gib(currently_used_bytes):.2f} GiB")
+    print(f"KV budget: {gib(kv_budget_bytes):.2f} GiB")
     print(f"Derived num_blocks: {num_blocks:,}")
-    print(
-        f"Derived token capacity: "
-        f"{num_blocks * BLOCK_SIZE:,}"
-    )
+    print(f"Derived token capacity: {num_blocks * BLOCK_SIZE:,}")
 
 
 if __name__ == "__main__":
