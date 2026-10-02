@@ -5,37 +5,8 @@ from typing import cast
 import pytest
 
 from serving.engine.batch_layout import BatchLayout
-from serving.engine.execution import ExecutionPhase, ModelExecution
-from serving.engine.request import Request
-from serving.engine.sequence import SequenceState
-
-
-def _execution(
-    request_id: str,
-    prompt_token_ids: tuple[int, ...],
-    phase: ExecutionPhase,
-    generated_token_ids: tuple[int, ...] = (),
-    slot_start: int = 0,
-) -> ModelExecution:
-    """Build a model execution with deterministic physical slots."""
-    request = Request(
-        request_id=request_id,
-        prompt_token_ids=prompt_token_ids,
-        max_new_tokens=16,
-    )
-
-    sequence = SequenceState(
-        request=request,
-        generated_token_ids=list(generated_token_ids),
-    )
-
-    slot_ids = tuple(range(slot_start, slot_start + sequence.current_length))
-
-    return ModelExecution(
-        sequence=sequence,
-        phase=phase,
-        slot_ids=slot_ids,
-    )
+from serving.engine.execution import ExecutionPhase
+from serving.engine.tests.helpers import make_execution
 
 
 def test_rejects_empty_batch() -> None:
@@ -44,9 +15,9 @@ def test_rejects_empty_batch() -> None:
         BatchLayout(executions=())
 
 
-def test_rejects_unsupported_execution_phase() -> None:
+def test_rejects_unsupportedmake_execution_phase() -> None:
     """Reject an execution whose phase is not supported."""
-    execution = _execution(
+    execution = make_execution(
         request_id="unsupported",
         prompt_token_ids=(10, 11, 12),
         phase=cast(ExecutionPhase, "unsupported"),
@@ -58,7 +29,7 @@ def test_rejects_unsupported_execution_phase() -> None:
 
 def test_single_prefill_uses_full_sequence_for_queries_and_keys() -> None:
     """Treat a fresh prefill sequence as full query and key history."""
-    execution = _execution(
+    execution = make_execution(
         request_id="prefill",
         prompt_token_ids=(10, 11, 12),
         phase=ExecutionPhase.PREFILL,
@@ -80,7 +51,7 @@ def test_single_prefill_uses_full_sequence_for_queries_and_keys() -> None:
 
 def test_single_decode_uses_one_query_and_full_key_history() -> None:
     """Treat decode as one query attending over the full sequence history."""
-    execution = _execution(
+    execution = make_execution(
         request_id="decode",
         prompt_token_ids=(20, 21, 22),
         generated_token_ids=(23,),
@@ -106,21 +77,21 @@ def test_single_decode_uses_one_query_and_full_key_history() -> None:
 def test_all_decode_batch_derives_independent_query_and_key_offsets() -> None:
     """Keep packed query and key spaces independent for decode-only batches."""
     executions = (
-        _execution(
+        make_execution(
             request_id="a",
             prompt_token_ids=(10, 11, 12, 13),
             generated_token_ids=(14,),
             phase=ExecutionPhase.DECODE,
             slot_start=0,
         ),
-        _execution(
+        make_execution(
             request_id="b",
             prompt_token_ids=(20, 21, 22, 23, 24, 25),
             generated_token_ids=(26, 27),
             phase=ExecutionPhase.DECODE,
             slot_start=10,
         ),
-        _execution(
+        make_execution(
             request_id="c",
             prompt_token_ids=(30, 31),
             generated_token_ids=(32,),
@@ -145,14 +116,14 @@ def test_all_decode_batch_derives_independent_query_and_key_offsets() -> None:
 
 def test_mixed_batch_derives_expected_packed_geometry() -> None:
     """Derive query and key regions for mixed prefill and decode work."""
-    prefill_a = _execution(
+    prefill_a = make_execution(
         request_id="a",
         prompt_token_ids=(10, 11, 12),
         phase=ExecutionPhase.PREFILL,
         slot_start=0,
     )
 
-    decode_b = _execution(
+    decode_b = make_execution(
         request_id="b",
         prompt_token_ids=(20, 21, 22),
         generated_token_ids=(23,),
@@ -160,7 +131,7 @@ def test_mixed_batch_derives_expected_packed_geometry() -> None:
         slot_start=10,
     )
 
-    prefill_c = _execution(
+    prefill_c = make_execution(
         request_id="c",
         prompt_token_ids=(30, 31),
         phase=ExecutionPhase.PREFILL,
@@ -183,7 +154,7 @@ def test_mixed_batch_derives_expected_packed_geometry() -> None:
 
 def test_reprefill_uses_complete_current_sequence_history() -> None:
     """Use prompt plus generated history when a sequence re-prefilled."""
-    execution = _execution(
+    execution = make_execution(
         request_id="reprefill",
         prompt_token_ids=(10, 11, 12),
         generated_token_ids=(40, 41),
@@ -206,19 +177,19 @@ def test_reprefill_uses_complete_current_sequence_history() -> None:
 def test_offsets_and_totals_are_self_consistent() -> None:
     """Keep packed offsets consistent with query and key token totals."""
     executions = (
-        _execution(
+        make_execution(
             request_id="a",
             prompt_token_ids=(1, 2, 3, 4),
             phase=ExecutionPhase.PREFILL,
         ),
-        _execution(
+        make_execution(
             request_id="b",
             prompt_token_ids=(5, 6),
             generated_token_ids=(7, 8, 9),
             phase=ExecutionPhase.DECODE,
             slot_start=10,
         ),
-        _execution(
+        make_execution(
             request_id="c",
             prompt_token_ids=(10, 11, 12),
             phase=ExecutionPhase.PREFILL,
