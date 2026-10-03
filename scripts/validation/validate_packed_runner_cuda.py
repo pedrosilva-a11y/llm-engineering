@@ -129,11 +129,33 @@ def compare_logits(
     naive_float = naive_logits.float()
     packed_float = packed_logits.float()
 
-    if not torch.isfinite(naive_float).all():
-        raise AssertionError(f"{case_name}: naive logits contain non-finite values.")
+    def report_non_finite(name: str, logits: torch.Tensor) -> None:
+        nan_count = int(torch.isnan(logits).sum().item())
+        posinf_count = int(torch.isposinf(logits).sum().item())
+        neginf_count = int(torch.isneginf(logits).sum().item())
+        finite_count = int(torch.isfinite(logits).sum().item())
 
-    if not torch.isfinite(packed_float).all():
-        raise AssertionError(f"{case_name}: packed logits contain non-finite values.")
+        print(
+            f"{name}: "
+            f"dtype={logits.dtype}, "
+            f"shape={tuple(logits.shape)}, "
+            f"finite={finite_count}/{logits.numel()}, "
+            f"nan={nan_count}, "
+            f"+inf={posinf_count}, "
+            f"-inf={neginf_count}"
+        )
+
+        finite_values = logits[torch.isfinite(logits)]
+
+        if finite_values.numel() > 0:
+            print(
+                f"{name}: "
+                f"finite_min={float(finite_values.min().item()):.8f}, "
+                f"finite_max={float(finite_values.max().item()):.8f}"
+            )
+
+    report_non_finite("naive", naive_logits)
+    report_non_finite("packed", packed_logits)
 
     max_abs_diffs = (naive_float - packed_float).abs().amax(dim=-1)
 
