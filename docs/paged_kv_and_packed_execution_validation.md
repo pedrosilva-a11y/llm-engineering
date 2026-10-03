@@ -6,8 +6,9 @@ fragmentation, output equivalence against the frozen reference set, and packed
 multi-sequence execution correctness on CUDA.
 
 **Status:** all executed checks pass. The single-sequence paged path reproduces the frozen
-reference exactly, and the packed multi-sequence path matches an independent naive
-runner across prefill, decode, and mixed execution on CUDA.
+reference exactly. The packed multi-sequence path matches an independent naive runner
+across prefill, decode, and mixed execution on CUDA and reproduces all five frozen Day 7
+reference cases exactly.
 
 | Environment | |
 |---|---|
@@ -19,10 +20,11 @@ runner across prefill, decode, and mixed execution on CUDA.
 
 ---
 
-## 1. Output equivalence
+## 1. Single-sequence output equivalence
 
-The gate. The paged implementation must produce the same tokens as the contiguous
-reference generated before any paging existed.
+This section records the Day 8 single-sequence paged gate. The paged implementation
+must produce the same tokens as the contiguous reference generated before any paging
+existed. Section 5 repeats the frozen-reference gate through concurrent packed execution.
 
 The frozen Day 7 reference set was generated in float16. Its attention backend was not
 explicitly pinned during reference generation, which the token-level equality contract
@@ -280,6 +282,29 @@ The correctness criterion remains token-level/top-1 equality rather than bitwise
 equality. FP16 differences are materially larger than the FP32 differences, as
 expected, but no tested case changed the selected token.
 
+### Frozen Day 7 reference gate
+
+The final packed correctness gate used the original five-case Day 7 frozen reference
+set, generated before paged KV caching and packed execution existed. All five requests
+were submitted concurrently so the runner exercised multi-sequence packed prefill and
+decode rather than single-sequence forwarding.
+
+The validation used the same model revision, float16 dtype, Tesla T4 GPU, and
+Transformers 5.17.0 environment recorded by the frozen artifact. SDPA was explicitly
+selected for the packed run; the frozen artifact did not pin its attention backend, so
+backend equality with the original generation is not asserted.
+
+| Case | Prompt | Generated | Finish | Result |
+|---|---:|---:|---|---|
+| `natural_eos` | 37 | 20 | eos | PASS |
+| `length_termination` | 44 | 4 | length | PASS |
+| `exact_block_boundary` | 48 | 8 | length | PASS |
+| `decode_crosses_block_boundary` | 47 | 8 | length | PASS |
+| `long_multi_block_prompt` | 55 | 12 | length | PASS |
+
+**All five matched exactly** — identical generated token identifiers and identical
+finish reasons through packed multi-sequence execution.
+
 ---
 
 ## 6. What this does not establish
@@ -294,11 +319,9 @@ expected, but no tested case changed the selected token.
   single-sequence.
 - **Sampling paths.** Reference validation uses greedy decoding, since sampling depends
   on generator state and call ordering.
-- **Sustained memory pressure.** Preemption and re-prefill interact with paged storage
-  but were not exercised on device.
-- **Packed execution against the frozen reference set.** The packed runner has passed
-  live differential validation against `NaiveModelRunner`, but the frozen five-case
-  Day 7 reference gate has not yet been rerun through the packed path.
+- **Sustained memory pressure and packed re-prefill.** The packed frozen-reference gate
+  ran without preemption. Preemption followed by re-prefill through packed execution
+  therefore remains unvalidated on device.
 
 ---
 
@@ -307,7 +330,7 @@ expected, but no tested case changed the selected token.
 ```text
 uv run python -m scripts.validate_paged_kv_cuda       # storage correctness
 uv run python -m scripts.reconcile_gpu_memory         # memory reconciliation
-uv run python -m scripts.validate_reference_outputs   # equivalence gate
+uv run python -m scripts.validate_reference_outputs   # packed frozen-reference gate
 uv run python -m scripts.measure_kv_fragmentation     # fragmentation (CPU)
 uv run python -m scripts.validation.validate_packed_runner_cuda  # packed CUDA differential
 ```
