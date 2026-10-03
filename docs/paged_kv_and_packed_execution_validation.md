@@ -1,17 +1,20 @@
-# Paged KV Cache Validation
+# Paged KV and Packed Execution Validation
 
 Validation results for the paged KV-cache implementation, covering physical storage
 correctness, memory reconciliation against the analytical cost model, prompt-level
-fragmentation, and output equivalence against the frozen reference set.
+fragmentation, output equivalence against the frozen reference set, and packed
+multi-sequence execution correctness on CUDA.
 
-**Status:** all checks pass. The paged path reproduces the contiguous reference exactly.
+**Status:** all executed checks pass. The single-sequence paged path reproduces the frozen
+reference exactly, and the packed multi-sequence path matches an independent naive
+runner across prefill, decode, and mixed execution on CUDA.
 
 | Environment | |
 |---|---|
 | GPU | Tesla T4 |
 | Model | `Qwen/Qwen2.5-1.5B-Instruct` |
 | Revision | `989aa7980e4cf806f80c7fef2b1adb7bc71aa306` |
-| Dtype | float16 |
+| Validation dtypes | float16, float32 |
 | Transformers | 5.17.0 |
 
 ---
@@ -20,6 +23,10 @@ fragmentation, and output equivalence against the frozen reference set.
 
 The gate. The paged implementation must produce the same tokens as the contiguous
 reference generated before any paging existed.
+
+The frozen Day 7 reference set was generated in float16. Its attention backend was not
+explicitly pinned during reference generation, which the token-level equality contract
+below accommodates.
 
 | Case | Prompt | Generated | Finish | Result |
 |---|---:|---:|---|---|
@@ -44,13 +51,16 @@ present different shapes than a contiguous cache, which may select a different b
 with different floating-point reduction order. In practice no divergence occurred at
 all, but the criterion was chosen in advance to avoid mistaking numerics for a bug.
 
+Backend and dtype behavior observed during packed validation is documented in
+Section 5, including an FP16 eager-attention NaN finding on the T4 environment.
+
 ---
 
 ## 2. Physical storage validation
 
 Direct validation of the KV storage layer on CUDA, independent of any model.
 
-```
+```text
 Cache shape: (28, 4096, 2, 128)     layers × slots × kv_heads × head_dim
 Blocks: 256 × block size 16 = 4,096 physical slots
 Allocated: 112.00 MiB
@@ -112,7 +122,7 @@ excludes attention and MLP projection biases, and names Qwen2.5 as an architectu
 carries them. Qwen2.5 applies biases to the query, key and value projections but not the
 output projection:
 
-```
+```text
 per layer:  q_dim + 2 × kv_dim  =  1536 + 512  =  2,048
 × 28 layers                                    =  57,344 parameters
 × 2 bytes (fp16)                               = 114,688 bytes
@@ -161,7 +171,7 @@ the benchmark phase should pin that card rather than accept whichever GPU is all
 weights. Subtracting weight bytes from it again would double-count them. The correct
 form is:
 
-```
+```text
 target_used    = total × utilization
 currently_used = total − free_after_load
 kv_budget      = max(0, target_used − currently_used)
@@ -197,10 +207,86 @@ means the two effects can be attributed independently once caching lands.
 
 ---
 
-## 5. What this does not establish
+## 5. Packed multi-sequence execution
 
-- **Batched execution.** The cache adapter is documented and enforced as single-sequence.
-  Multi-sequence forward passes are not yet validated.
+Day 9a replaced sequential per-sequence Hugging Face forwards with one packed model
+forward. Correctness was validated against `NaiveModelRunner`, which recomputes each
+complete sequence history independently with KV caching disabled.
+
+`NaiveModelRunner` ignores execution phase and always recomputes the complete token
+history, so decode comparisons remain independent of the paged KV state.
+
+Both runners shared the exact same loaded model object so that checkpoint, weights,
+dtype, device, and attention backend were held constant. Fresh paged KV storage was
+created for each validation case.
+
+### FP32 eager differential
+
+The first CUDA differential used float32 with eager attention.
+
+| Case | Max absolute logit diff | Smallest top-2 margin | Top-1 |
+|---|---:|---:|---|
+| unequal prefill + prefill | 0.00002635 | 1.42997 | PASS |
+| unequal decode + decode | 0.00002146 | 0.06114 | PASS |
+| decode + prefill | 0.00001359 | 0.08971 | PASS |
+
+Each row reports the maximum absolute logit difference observed across sequences in that
+case and the smallest top-2 margin observed across both runners and all sequences in that
+case.
+
+All predictions matched. The small numerical differences are consistent with
+floating-point operation-order differences; no evidence of a semantic difference
+between the independently recomputed and packed execution paths was observed.
+
+The decode cases are particularly important because the paged runner first populated
+the cache with real model-produced prefix KV states, then processed only the newest
+token while gathering the complete history from paged storage. The naive runner
+independently recomputed the same full history from token ids.
+
+### FP16 backend finding
+
+An initial float16 eager-attention run produced only NaN logits. The failure was
+isolated outside the serving engine with a minimal Hugging Face forward using the same
+Qwen checkpoint:
+
+- float16 + eager attention: all logits NaN
+- float16 + SDPA: all logits finite
+- float32 + eager attention: finite during the runner differential
+
+The exact operation that first produces the NaN under float16 eager attention was not
+localized, so this is recorded as an environment/backend finding rather than attributed
+to a particular kernel or model operation.
+
+### FP16 SDPA differential
+
+Repeating the packed differential with float16 and SDPA produced finite logits and
+matching top-1 predictions in all cases:
+
+| Case | Max absolute logit diff | Smallest top-2 margin | Top-1 |
+|---|---:|---:|---|
+| unequal prefill + prefill | 0.02734375 | 1.42187500 | PASS |
+| unequal decode + decode | 0.02050781 | 0.05468750 | PASS |
+| decode + prefill | 0.01171875 | 0.08593750 | PASS |
+
+Each row reports the maximum absolute logit difference observed across sequences in that
+case and the smallest top-2 margin observed across both runners and all sequences in that
+case.
+
+This also establishes that the explicit 4D additive block-diagonal attention mask used
+by the packed runner is accepted and behaves correctly through the SDPA path for these
+validation cases.
+
+The correctness criterion remains token-level/top-1 equality rather than bitwise logit
+equality. FP16 differences are materially larger than the FP32 differences, as
+expected, but no tested case changed the selected token.
+
+---
+
+## 6. What this does not establish
+
+- **Production-efficient packed attention.** Multi-sequence execution is validated for
+  correctness, but the current block-diagonal mask is dense. It establishes semantic
+  isolation, not sparse/paged-kernel FLOP efficiency.
 - **Performance.** No timing was collected. Gather and scatter are implemented as
   ordinary indexing operations, not fused kernels, and are expected to be substantially
   slower than a specialized implementation.
@@ -210,19 +296,26 @@ means the two effects can be attributed independently once caching lands.
   on generator state and call ordering.
 - **Sustained memory pressure.** Preemption and re-prefill interact with paged storage
   but were not exercised on device.
+- **Packed execution against the frozen reference set.** The packed runner has passed
+  live differential validation against `NaiveModelRunner`, but the frozen five-case
+  Day 7 reference gate has not yet been rerun through the packed path.
 
 ---
 
-## 6. Reproducing
+## 7. Reproducing
 
-```
+```text
 uv run python -m scripts.validate_paged_kv_cuda       # storage correctness
 uv run python -m scripts.reconcile_gpu_memory         # memory reconciliation
 uv run python -m scripts.validate_reference_outputs   # equivalence gate
 uv run python -m scripts.measure_kv_fragmentation     # fragmentation (CPU)
+uv run python -m scripts.validation.validate_packed_runner_cuda  # packed CUDA differential
 ```
 
-The first three require CUDA and are excluded from the default test target, which
-remains GPU-free. Reference data lives in
+The packed differential lives under `scripts/validation/`; the earlier Day 7 and Day 8
+validation utilities remain top-level modules under `scripts/`.
+
+All validation commands above except fragmentation require CUDA and are excluded from
+the default test target, which remains GPU-free. Reference data lives in
 `reference_outputs/day7_qwen2_5_1_5b.json`, with full generation conditions recorded
 alongside the outputs.
