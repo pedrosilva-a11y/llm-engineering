@@ -130,14 +130,10 @@ def compare_logits(
     packed_float = packed_logits.float()
 
     if not torch.isfinite(naive_float).all():
-        raise AssertionError(
-            f"{case_name}: naive logits contain non-finite values."
-        )
+        raise AssertionError(f"{case_name}: naive logits contain non-finite values.")
 
     if not torch.isfinite(packed_float).all():
-        raise AssertionError(
-            f"{case_name}: packed logits contain non-finite values."
-        )
+        raise AssertionError(f"{case_name}: packed logits contain non-finite values.")
 
     max_abs_diffs = (naive_float - packed_float).abs().amax(dim=-1)
 
