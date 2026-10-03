@@ -17,7 +17,7 @@ from serving.engine.sequence import SequenceState
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 
-DTYPE = torch.float16
+DTYPE = torch.float32
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
 TOTAL_SLOTS = NUM_BLOCKS * BLOCK_SIZE
@@ -129,33 +129,15 @@ def compare_logits(
     naive_float = naive_logits.float()
     packed_float = packed_logits.float()
 
-    def report_non_finite(name: str, logits: torch.Tensor) -> None:
-        nan_count = int(torch.isnan(logits).sum().item())
-        posinf_count = int(torch.isposinf(logits).sum().item())
-        neginf_count = int(torch.isneginf(logits).sum().item())
-        finite_count = int(torch.isfinite(logits).sum().item())
-
-        print(
-            f"{name}: "
-            f"dtype={logits.dtype}, "
-            f"shape={tuple(logits.shape)}, "
-            f"finite={finite_count}/{logits.numel()}, "
-            f"nan={nan_count}, "
-            f"+inf={posinf_count}, "
-            f"-inf={neginf_count}"
+    if not torch.isfinite(naive_float).all():
+        raise AssertionError(
+            f"{case_name}: naive logits contain non-finite values."
         )
 
-        finite_values = logits[torch.isfinite(logits)]
-
-        if finite_values.numel() > 0:
-            print(
-                f"{name}: "
-                f"finite_min={float(finite_values.min().item()):.8f}, "
-                f"finite_max={float(finite_values.max().item()):.8f}"
-            )
-
-    report_non_finite("naive", naive_logits)
-    report_non_finite("packed", packed_logits)
+    if not torch.isfinite(packed_float).all():
+        raise AssertionError(
+            f"{case_name}: packed logits contain non-finite values."
+        )
 
     max_abs_diffs = (naive_float - packed_float).abs().amax(dim=-1)
 
@@ -237,9 +219,6 @@ def validate_unequal_prefills(
 
     naive_logits = naive_runner.forward(executions)
     packed_logits = paged_runner.forward(executions)
-
-    print("naive logits dtype:", naive_logits.dtype)
-    print("packed logits dtype:", packed_logits.dtype)
 
     compare_logits(
         "9a.7a unequal PREFILL + PREFILL",
