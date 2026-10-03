@@ -42,6 +42,7 @@ class ReferenceMetadata:
     block_size: int
     eos_token_id: int
     seed: int
+    greedy: bool
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ def load_reference() -> tuple[ReferenceMetadata, tuple[ReferenceCase, ...]]:
         block_size=int(metadata_raw["block_size"]),
         eos_token_id=int(metadata_raw["eos_token_id"]),
         seed=int(metadata_raw["seed"]),
+        greedy=bool(metadata_raw["sampling"]["greedy"]),
     )
 
     cases = tuple(
@@ -119,6 +121,7 @@ def validate_reference_metadata(
             metadata.transformers_version,
             transformers.__version__,
         ),
+        ("greedy", metadata.greedy, True),
     )
 
     for name, actual, expected in expected_values:
@@ -220,6 +223,7 @@ def main() -> None:
         MODEL_ID,
         revision=REVISION,
         dtype=DTYPE,
+        attn_implementation="sdpa",
     )
     loaded_model = loaded_model.to(device)
 
@@ -248,7 +252,7 @@ def main() -> None:
     engine = Engine(
         configuration=EngineConfiguration(
             device="cuda",
-            max_sequences=1,
+            max_sequences=len(cases),
             eos_token_id=EXPECTED_EOS_TOKEN_ID,
             block_size=BLOCK_SIZE,
             num_blocks=NUM_BLOCKS,
@@ -259,7 +263,9 @@ def main() -> None:
     )
 
     print()
-    print("=== Paged KV configuration ===")
+    print("=== Packed paged KV configuration ===")
+    print("Attention: sdpa")
+    print(f"Max sequences: {len(cases)}")
     print(f"Layers: {num_layers}")
     print(f"KV heads: {num_kv_heads}")
     print(f"Head dimension: {head_dim}")
@@ -269,6 +275,8 @@ def main() -> None:
 
     print()
     print("=== Reference validation ===")
+
+    submitted_cases = []
 
     for case in cases:
         request = Request(
@@ -281,8 +289,13 @@ def main() -> None:
         )
 
         sequence = engine.submit(request)
-        engine.run_until_complete()
+        submitted_cases.append((case, sequence))
 
+    # Run all frozen cases concurrently so PagedModelRunner receives real
+    # multi-sequence packed prefill and decode batches.
+    engine.run_until_complete()
+
+    for case, sequence in submitted_cases:
         if sequence.finish_reason is None:
             raise RuntimeError(f"Case {case.name!r} did not finish.")
 
