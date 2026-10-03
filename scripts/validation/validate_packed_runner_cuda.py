@@ -17,7 +17,7 @@ from serving.engine.sequence import SequenceState
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 
-DTYPE = torch.float32
+DTYPE = torch.float16
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
 TOTAL_SLOTS = NUM_BLOCKS * BLOCK_SIZE
@@ -31,7 +31,7 @@ def load_model(device: torch.device) -> PreTrainedModel:
         MODEL_ID,
         revision=REVISION,
         dtype=DTYPE,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
     loaded_model = loaded_model.to(device)
 
@@ -363,7 +363,7 @@ def main() -> None:
     print(f"Model: {MODEL_ID}")
     print(f"Revision: {REVISION}")
     print(f"Dtype: {DTYPE}")
-    print("Attention: eager")
+    print("Attention: sdpa")
 
     model = load_model(device)
 
