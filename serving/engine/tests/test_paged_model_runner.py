@@ -8,7 +8,7 @@ import torch
 from transformers import PreTrainedModel
 
 from serving.engine.execution import ExecutionPhase, ModelExecution
-from serving.engine.hf_paged_cache import HFPagedCache
+from serving.engine.hf_batched_paged_cache import HFBatchedPagedCache
 from serving.engine.paged_kv_cache import PagedKVCache
 from serving.engine.paged_kv_storage import PagedKVStorage
 from serving.engine.paged_model_runner import PagedModelRunner
@@ -32,12 +32,21 @@ class RecordingCausalModel(torch.nn.Module):
         """Initialize the recording model."""
         super().__init__()
         self.input_id_calls: list[tuple[int, ...]] = []
-        self.cache_calls: list[HFPagedCache] = []
+        self.position_id_calls: list[tuple[int, ...]] = []
+        self.attention_mask_calls: list[torch.Tensor] = []
+        self.cache_calls: list[HFBatchedPagedCache] = []
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Return the model dtype expected by the runner."""
+        return DTYPE
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        past_key_values: HFPagedCache,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_key_values: HFBatchedPagedCache,
         use_cache: bool,
     ) -> SimpleNamespace:
         """Return deterministic logits and write synthetic KV states."""
@@ -47,6 +56,10 @@ class RecordingCausalModel(torch.nn.Module):
         self.input_id_calls.append(
             tuple(int(token_id) for token_id in input_ids[0].tolist())
         )
+        self.position_id_calls.append(
+            tuple(int(position_id) for position_id in position_ids[0].tolist())
+        )
+        self.attention_mask_calls.append(attention_mask.detach().clone())
         self.cache_calls.append(past_key_values)
 
         query_length = input_ids.shape[1]
@@ -77,8 +90,9 @@ class RecordingCausalModel(torch.nn.Module):
             device=input_ids.device,
         )
 
-        next_token_id = int(input_ids[0, -1]) % VOCAB_SIZE
-        logits[0, -1, next_token_id] = 0.0
+        for query_index, token_id in enumerate(input_ids[0].tolist()):
+            next_token_id = int(token_id) % VOCAB_SIZE
+            logits[0, query_index, next_token_id] = 0.0
 
         return SimpleNamespace(logits=logits)
 
@@ -225,7 +239,7 @@ def test_reprefill_uses_complete_generated_history(
     assert recording_model.input_id_calls == [(1, 4, 5, 6, 7)]
 
 
-def test_forward_returns_one_logit_vector_per_execution(
+def test_forward_packs_multiple_executions_into_one_model_call(
     recording_model: RecordingCausalModel,
     storage: PagedKVStorage,
 ) -> None:
@@ -252,10 +266,49 @@ def test_forward_returns_one_logit_vector_per_execution(
     logits = runner.forward((first, second))
 
     assert logits.shape == (2, VOCAB_SIZE)
-    assert recording_model.input_id_calls == [
-        (1, 4),
-        (1, 9, 10),
-    ]
+    assert recording_model.input_id_calls == [(1, 4, 1, 9, 10)]
+    assert len(recording_model.input_id_calls) == 1
+
+
+def test_forward_packs_decode_and_prefill_into_one_model_call(
+    recording_model: RecordingCausalModel,
+    storage: PagedKVStorage,
+) -> None:
+    """Run decode and prefill work in one packed model invocation."""
+    runner = make_runner(recording_model, storage)
+
+    decode = make_execution(
+        sequence=make_sequence(
+            prompt_token_ids=(1, 4, 5),
+            generated_token_ids=(6,),
+            request_id="decode",
+        ),
+        phase=ExecutionPhase.DECODE,
+        slot_ids=(7, 2, 11, 5),
+    )
+
+    prefill = make_execution(
+        sequence=make_sequence(
+            prompt_token_ids=(9, 10),
+            request_id="prefill",
+        ),
+        phase=ExecutionPhase.PREFILL,
+        slot_ids=(16, 17),
+    )
+
+    logits = runner.forward((decode, prefill))
+
+    assert recording_model.input_id_calls == [(6, 9, 10)]
+    assert recording_model.position_id_calls == [(3, 0, 1)]
+
+    assert len(recording_model.input_id_calls) == 1
+    assert len(recording_model.position_id_calls) == 1
+
+    assert recording_model.attention_mask_calls[0].shape == (1, 1, 3, 6)
+
+    assert logits.shape == (2, VOCAB_SIZE)
+    assert int(torch.argmax(logits[0])) == 6
+    assert int(torch.argmax(logits[1])) == 10
 
 
 def test_forward_preserves_execution_order(
@@ -288,11 +341,11 @@ def test_forward_preserves_execution_order(
     assert int(torch.argmax(logits[1])) == 9
 
 
-def test_forward_passes_hf_paged_cache_to_model(
+def test_forward_passes_hf_batched_paged_cache_to_model(
     recording_model: RecordingCausalModel,
     storage: PagedKVStorage,
 ) -> None:
-    """Provide a Hugging Face paged cache for each model execution."""
+    """Provide one batched Hugging Face paged cache to the packed model call."""
     runner = make_runner(recording_model, storage)
     sequence = make_sequence(prompt_token_ids=(1, 4, 5))
     execution = make_execution(
@@ -304,7 +357,7 @@ def test_forward_passes_hf_paged_cache_to_model(
     runner.forward((execution,))
 
     assert len(recording_model.cache_calls) == 1
-    assert isinstance(recording_model.cache_calls[0], HFPagedCache)
+    assert isinstance(recording_model.cache_calls[0], HFBatchedPagedCache)
 
 
 def test_prefill_writes_kv_states_to_physical_slots(

@@ -75,3 +75,46 @@ def build_attention_mask(layout: BatchLayout, *, device: torch.device) -> torch.
         ] = local_mask
 
     return mask
+
+
+def semantic_to_additive_attention_mask(
+    semantic_mask: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Convert a semantic attention mask to Hugging Face additive format.
+
+    The engine semantic mask uses ``True`` for allowed attention and ``False`` for
+    blocked attention. Hugging Face eager attention expects a floating-point additive
+    mask shaped ``(batch, heads, query_tokens, key_tokens)``.
+
+    Args:
+        semantic_mask: Boolean mask with shape
+            ``(total_query_tokens, total_key_tokens)``.
+        dtype: Floating-point dtype used by the model attention computation.
+
+    Returns:
+        Additive attention mask with shape
+            ``(1, 1, total_query_tokens, total_key_tokens)``.
+
+    Raises:
+        ValueError: If the semantic mask geometry or dtype is unsupported.
+    """
+    if semantic_mask.ndim != 2:
+        raise ValueError("Semantic attention mask must be two-dimensional.")
+
+    if semantic_mask.dtype != torch.bool:
+        raise ValueError("Semantic attention mask must use boolean dtype.")
+
+    if not torch.empty((), dtype=dtype).is_floating_point():
+        raise ValueError("Additive attention mask must use a floating-point dtype.")
+
+    additive_mask = torch.zeros(
+        semantic_mask.shape,
+        dtype=dtype,
+        device=semantic_mask.device,
+    )
+
+    additive_mask.masked_fill_(~semantic_mask, torch.finfo(dtype).min)
+
+    return additive_mask.unsqueeze(0).unsqueeze(0)

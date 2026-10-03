@@ -6,18 +6,21 @@ from typing import Any, cast
 import torch
 from transformers import PreTrainedModel
 
-from serving.engine.execution import ExecutionPhase, ModelExecution
-from serving.engine.hf_paged_cache import HFPagedCache
+from serving.engine.attention_mask import (
+    build_attention_mask,
+    semantic_to_additive_attention_mask,
+)
+from serving.engine.batch_layout import BatchLayout
+from serving.engine.execution import ModelExecution
+from serving.engine.hf_batched_paged_cache import HFBatchedPagedCache
+from serving.engine.packed_inputs import build_packed_inputs
 from serving.engine.paged_kv_cache import PagedKVCache
 
 
 class PagedModelRunner:
     """Run a causal LM with paged KV-cache storage.
 
-    Each scheduled execution is evaluated independently with Hugging Face batch
-    size one. Prefill executions process the complete logical sequence history,
-    while decode executions process only the newest token and recover prior
-    attention state from the paged KV cache.
+    All scheduled executions are packed into one Hugging Face model forward.
 
     Args:
         model: Pre-loaded Hugging Face causal language model.
@@ -39,56 +42,50 @@ class PagedModelRunner:
         cast(torch.nn.Module, self._model).eval()
 
     def forward(self, executions: Sequence[ModelExecution]) -> torch.Tensor:
-        """Return next-token logits for each paged model execution.
+        """Return next-token logits from one packed model forward.
 
         Args:
             executions: Scheduled model executions to evaluate.
 
         Returns:
-            Next-token logits with shape ``(batch_size, vocab_size)``.
+            Next-token logits with shape ``(num_executions, vocab_size)``.
 
         Raises:
-            ValueError: If no executions are provided or an execution phase is
-                unsupported.
+            ValueError: If no executions are provided.
         """
         if not executions:
             raise ValueError("At least one execution is required.")
 
-        batch_logits: list[torch.Tensor] = []
+        layout = BatchLayout(executions=tuple(executions))
+
+        packed = build_packed_inputs(layout, device=self._device)
+
+        semantic_mask = build_attention_mask(layout, device=self._device)
+
+        model_attention_mask = semantic_to_additive_attention_mask(
+            semantic_mask,
+            dtype=self._model.dtype,
+        )
+
+        hf_cache = HFBatchedPagedCache(paged_cache=self._paged_cache, layout=layout)
+
         model_callable: Any = self._model
 
         with torch.inference_mode():
-            for execution in executions:
-                input_token_ids = self._input_token_ids(execution)
-                input_ids = torch.tensor(
-                    input_token_ids,
-                    dtype=torch.long,
-                    device=self._device,
-                ).unsqueeze(0)
+            outputs: Any = model_callable(
+                input_ids=packed.input_ids.unsqueeze(0),
+                position_ids=packed.position_ids.unsqueeze(0),
+                attention_mask=model_attention_mask,
+                past_key_values=hf_cache,
+                use_cache=True,
+            )
 
-                hf_cache = HFPagedCache(
-                    paged_cache=self._paged_cache,
-                    execution=execution,
-                )
+        logits = cast(torch.Tensor, outputs.logits)
 
-                outputs: Any = model_callable(
-                    input_ids=input_ids,
-                    past_key_values=hf_cache,
-                    use_cache=True,
-                )
+        logit_indices = torch.tensor(
+            layout.logit_indices,
+            dtype=torch.long,
+            device=self._device,
+        )
 
-                logits = cast(torch.Tensor, outputs.logits)
-                batch_logits.append(logits[0, -1, :])
-
-        return torch.stack(batch_logits)
-
-    @staticmethod
-    def _input_token_ids(execution: ModelExecution) -> tuple[int, ...]:
-        """Return token identifiers that should be evaluated for an execution."""
-        if execution.phase is ExecutionPhase.PREFILL:
-            return execution.sequence.all_token_ids
-
-        if execution.phase is ExecutionPhase.DECODE:
-            return execution.sequence.all_token_ids[-1:]
-
-        raise ValueError(f"Unsupported execution phase: {execution.phase}")
+        return logits[0].index_select(dim=0, index=logit_indices)

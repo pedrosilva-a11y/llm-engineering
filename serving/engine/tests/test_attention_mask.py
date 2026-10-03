@@ -1,11 +1,17 @@
 """Tests for packed block-diagonal causal attention masks."""
 
+import pytest
 import torch
 
-from serving.engine.attention_mask import build_attention_mask
+from serving.engine.attention_mask import (
+    build_attention_mask,
+    semantic_to_additive_attention_mask,
+)
 from serving.engine.batch_layout import BatchLayout
 from serving.engine.execution import ExecutionPhase
 from serving.engine.tests.helpers import make_execution
+
+# Attention mask building
 
 
 def test_single_prefill_builds_lower_triangular_mask() -> None:
@@ -259,3 +265,82 @@ def test_attention_mask_matches_layout_shape_dtype_and_device() -> None:
     assert mask.shape == (layout.total_query_tokens, layout.total_key_tokens)
     assert mask.dtype == torch.bool
     assert mask.device == device
+
+
+# Semantic to additive attention mask
+
+
+def test_additive_mask_converts_allowed_and_blocked_positions() -> None:
+    """Convert allowed positions to zero and blocked positions to finite minimum."""
+    semantic_mask = torch.tensor(
+        [
+            [True, False, False],
+            [True, True, False],
+        ],
+        dtype=torch.bool,
+    )
+
+    mask = semantic_to_additive_attention_mask(semantic_mask, dtype=torch.float32)
+
+    blocked = torch.finfo(torch.float32).min
+
+    expected = torch.tensor(
+        [
+            [
+                [
+                    [0.0, blocked, blocked],
+                    [0.0, 0.0, blocked],
+                ]
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(mask, expected)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float16, torch.float32, torch.float64],
+)
+def test_additive_mask_matches_model_facing_shape_dtype_and_device(
+    dtype: torch.dtype,
+) -> None:
+    """Produce model-facing mask geometry with the requested floating dtype."""
+    semantic_mask = torch.tensor(
+        [
+            [True, False],
+            [True, True],
+        ],
+        dtype=torch.bool,
+    )
+
+    mask = semantic_to_additive_attention_mask(semantic_mask, dtype=dtype)
+
+    assert mask.shape == (1, 1, 2, 2)
+    assert mask.dtype == dtype
+    assert mask.device == semantic_mask.device
+
+
+def test_additive_mask_rejects_non_two_dimensional_semantic_mask() -> None:
+    """Reject semantic masks outside query-by-key geometry."""
+    semantic_mask = torch.ones((1, 2, 2), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="must be two-dimensional"):
+        semantic_to_additive_attention_mask(semantic_mask, dtype=torch.float32)
+
+
+def test_additive_mask_rejects_non_boolean_semantic_mask() -> None:
+    """Require semantic masks to use the engine's boolean representation."""
+    semantic_mask = torch.ones((2, 2), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="must use boolean dtype"):
+        semantic_to_additive_attention_mask(semantic_mask, dtype=torch.float32)
+
+
+def test_additive_mask_rejects_non_floating_output_dtype() -> None:
+    """Require the model-facing additive mask to use floating-point values."""
+    semantic_mask = torch.ones((2, 2), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="must use a floating-point dtype"):
+        semantic_to_additive_attention_mask(semantic_mask, dtype=torch.int64)
