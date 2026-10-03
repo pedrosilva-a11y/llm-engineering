@@ -238,6 +238,9 @@ def validate_unequal_prefills(
     naive_logits = naive_runner.forward(executions)
     packed_logits = paged_runner.forward(executions)
 
+    print("naive logits dtype:", naive_logits.dtype)
+    print("packed logits dtype:", packed_logits.dtype)
+
     compare_logits(
         "9a.7a unequal PREFILL + PREFILL",
         naive_logits,
