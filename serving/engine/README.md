@@ -20,6 +20,12 @@ Supporting components include:
 * `SequenceState` for mutable request-generation state.
 * `BlockPool` for physical KV-cache block ownership.
 * `BlockTable` for logical-to-physical KV block mappings.
+* `PagedKVStorage` for CUDA-backed physical KV tensor storage.
+* `PagedKVCache` for phase-aware KV writes and logical-order gathers.
+* `BatchLayout` for packed query/key geometry across scheduled sequences.
+* `PackedInputs` for packed token ids and sequence-local positions.
+* `HFBatchedPagedCache` for adapting packed paged KV state to the Hugging Face cache interface.
+* `PagedModelRunner` for one-forward packed multi-sequence model execution.
 * `EngineConfiguration` for runtime capacity and scheduling limits.
 
 The intended ownership boundary is:
@@ -38,6 +44,32 @@ Engine
 └── SequenceState
     └── generated-token and lifecycle state
 ```
+
+## Packed multi-sequence execution
+
+Scheduled decode work and newly admitted prefill work are represented as
+`ModelExecution` objects and passed to the runner together.
+
+`PagedModelRunner` packs those executions into one Hugging Face model forward:
+
+```text
+scheduled executions
+→ BatchLayout
+→ packed token ids + sequence-local positions
+→ block-diagonal causal attention mask
+→ HFBatchedPagedCache
+→ one model forward
+→ per-sequence final-token logits
+```
+
+Prefill executions contribute their complete current token history as queries.
+Decode executions contribute only the newest token as a query while attending to
+their complete KV history.
+
+The block-diagonal attention mask provides semantic isolation between sequences in
+the packed forward. The current implementation uses a dense mask, so this validates
+packed execution correctness but does not provide the FLOP efficiency of a
+specialized paged-attention kernel.
 
 ## Recompute preemption
 
@@ -338,9 +370,18 @@ The engine intentionally does not yet model several production-serving features:
 * sophisticated fairness policies;
 * chunked prefill;
 * prefix caching;
-* real KV tensors;
+* specialized sparse or paged-attention kernels;
+* fused KV-cache gather/scatter operations;
 * optimized recomputation;
 * distributed execution.
+
+Packed multi-sequence execution currently uses a dense block-diagonal attention
+mask. It establishes semantic isolation and correctness, not production-efficient
+attention FLOPs.
+
+Preemption and re-prefill are implemented in the scheduler lifecycle, but
+preemption followed by packed re-prefill has not yet been validated under sustained
+GPU memory pressure.
 
 These features can be layered onto the existing scheduler and lifecycle model
 without changing the core ownership boundaries described above.
