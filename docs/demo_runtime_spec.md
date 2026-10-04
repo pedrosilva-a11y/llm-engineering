@@ -115,6 +115,13 @@ Before the GPU environment becomes the final demo target, it must satisfy all of
 
 - NVIDIA L4 is visible through CUDA.
 - Python 3.11 project environment installs successfully with `uv`.
+- The pinned Qwen tokenizer integration test passes:
+
+  ```bash
+  RUN_TOKENIZER_INTEGRATION=1 uv run pytest \
+    serving/gateway/tests/test_tokenizer_integration.py -v
+  ```
+
 - The pinned Qwen revision loads successfully in FP16.
 - SDPA produces finite logits.
 - The real `PagedModelRunner` completes a request successfully.
