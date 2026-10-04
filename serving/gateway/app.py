@@ -1,19 +1,21 @@
-"""OpenAI-compatible streaming HTTP gateway for the inference engine."""
+"""OpenAI-style streaming HTTP gateway for the inference engine."""
 
 import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from typing import Self
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from serving.engine.engine import Engine
 from serving.engine.request import Request
 from serving.engine.sequence import FinishReason, SequenceState
+from serving.gateway.tokenizer import TextTokenizer
 
 
 class CompletionRequest(BaseModel):
@@ -21,15 +23,27 @@ class CompletionRequest(BaseModel):
 
     Attributes:
         model: Model identifier supplied by the client.
-        prompt_token_ids: Tokenized prompt supplied to the inference engine.
+        prompt: Human-readable prompt to tokenize before inference.
+        prompt_token_ids: Pre-tokenized prompt supplied directly to the engine.
         max_tokens: Maximum number of generated tokens.
         stream: Whether streaming output is requested.
     """
 
     model: str = Field(min_length=1)
-    prompt_token_ids: list[int] = Field(min_length=1)
+    prompt: str | None = None
+    prompt_token_ids: list[int] | None = Field(default=None, min_length=1)
     max_tokens: int = Field(gt=0)
     stream: bool = True
+
+    @model_validator(mode="after")
+    def validate_prompt_source(self) -> Self:
+        """Require exactly one text or tokenized prompt representation."""
+        if (self.prompt is None) == (self.prompt_token_ids is None):
+            raise ValueError(
+                "Exactly one of prompt or prompt_token_ids must be provided.",
+            )
+
+        return self
 
 
 @dataclass(frozen=True)
@@ -185,11 +199,12 @@ class _EngineStreamBroker:
             del self._streams[request_id]
 
 
-def create_gateway_app(engine: Engine) -> FastAPI:
+def create_gateway_app(engine: Engine, tokenizer: TextTokenizer) -> FastAPI:
     """Create an HTTP gateway around one shared inference engine.
 
     Args:
         engine: Inference engine serving completion requests.
+        tokenizer: Text tokenizer used to encode prompts and decode generated tokens.
 
     Returns:
         FastAPI application exposing the completions endpoint.
@@ -210,26 +225,48 @@ def create_gateway_app(engine: Engine) -> FastAPI:
     async def create_completion(
         request: CompletionRequest,
     ) -> StreamingResponse:
-        """Submit a generation request and stream generated tokens."""
+        """Submit a generation request and stream generated tokens.
+
+        Args:
+            request: Validated completion request containing either human-readable
+                prompt text or pre-tokenized prompt identifiers.
+
+        Returns:
+            Streaming response containing generated completion events.
+
+        Raises:
+            HTTPException: If non-streaming generation is requested or prompt encoding,
+                engine request validation, or scheduler submission rejects the input.
+            RuntimeError: If tokenizer processing fails unexpectedly, a validated
+                request violates the prompt-source invariant, or the engine stream
+                broker has already been closed.
+        """
         if not request.stream:
             raise HTTPException(
                 status_code=400,
                 detail="gateway supports streaming requests only.",
             )
 
-        engine_request = Request(
-            request_id=f"gateway-{uuid4().hex}",
-            prompt_token_ids=tuple(request.prompt_token_ids),
-            max_new_tokens=request.max_tokens,
-        )
-
         try:
+            if request.prompt_token_ids is not None:
+                prompt_token_ids = tuple(request.prompt_token_ids)
+            elif request.prompt is not None:
+                prompt_token_ids = tokenizer.encode_prompt(request.prompt)
+            else:
+                raise RuntimeError(
+                    "validated completion request does not contain a prompt source.",
+                )
+
+            engine_request = Request(
+                request_id=f"gateway-{uuid4().hex}",
+                prompt_token_ids=prompt_token_ids,
+                max_new_tokens=request.max_tokens,
+            )
+
             queue = broker.submit(engine_request)
+
         except ValueError as error:
-            raise HTTPException(
-                status_code=400,
-                detail=str(error),
-            ) from error
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
         return StreamingResponse(
             _stream_completion(
@@ -237,6 +274,7 @@ def create_gateway_app(engine: Engine) -> FastAPI:
                 model_name=request.model,
                 queue=queue,
                 broker=broker,
+                tokenizer=tokenizer,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
@@ -251,14 +289,42 @@ async def _stream_completion(
     model_name: str,
     queue: asyncio.Queue[_TokenEvent | None],
     broker: _EngineStreamBroker,
+    tokenizer: TextTokenizer,
 ) -> AsyncIterator[str]:
-    """Serialize generated token events as server-sent events."""
+    """Serialize generated token events into a server-sent event stream.
+
+    Generated token IDs are accumulated and decoded as a complete prefix so each
+    emitted payload contains the cumulative human-readable completion text. The
+    stream terminates with the standard ``[DONE]`` sentinel. If the consumer
+    disconnects or closes the stream early, the associated engine request is
+    cancelled through the broker.
+
+    Args:
+        request_id: Unique identifier of the generation request being streamed.
+        model_name: Model identifier reported in each completion payload.
+        queue: Request-specific queue containing generated token events. A ``None``
+            item indicates that generation has completed and no further tokens
+            will be emitted.
+        broker: Shared engine stream broker used to cancel the request when the
+            stream terminates or is closed by the consumer.
+        tokenizer: Text tokenizer used to decode the accumulated generated token
+            identifiers into cumulative completion text.
+
+    Yields:
+        Serialized server-sent event strings for each generated token, followed
+        by a final ``data: [DONE]`` event when generation completes.
+    """
+    generated_token_ids: list[int] = []
+
     try:
         while True:
             event = await queue.get()
 
             if event is None:
                 break
+
+            generated_token_ids.append(event.token_id)
+            cumulative_text = tokenizer.decode(generated_token_ids)
 
             finish_reason = (
                 event.finish_reason.value if event.finish_reason is not None else None
@@ -271,6 +337,7 @@ async def _stream_completion(
                 "choices": [
                     {
                         "index": 0,
+                        "cumulative_text": cumulative_text,
                         "token_id": event.token_id,
                         "finish_reason": finish_reason,
                     }

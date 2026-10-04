@@ -19,6 +19,8 @@ from serving.gateway.app import (
     _TokenEvent,
     create_gateway_app,
 )
+from serving.gateway.tests.helpers import FakeTextTokenizer
+from serving.gateway.tokenizer import TextTokenizer
 
 
 @pytest.fixture
@@ -28,16 +30,17 @@ def anyio_backend() -> str:
 
 
 @pytest.mark.anyio
-async def test_completion_streams_generated_tokens_and_done() -> None:
-    """Stream generated tokens followed by the terminal DONE event."""
+async def test_completion_streams_cumulative_text_and_done() -> None:
+    """Tokenize a text prompt and stream cumulative decoded text."""
     engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
 
-    async with _gateway_client(engine) as client:
+    async with _gateway_client(engine, tokenizer) as client:
         response = await client.post(
             "/v1/completions",
             json={
                 "model": "stub-model",
-                "prompt_token_ids": [1, 2, 3],
+                "prompt": "Explain paged KV caching.",
                 "max_tokens": 3,
                 "stream": True,
             },
@@ -46,6 +49,8 @@ async def test_completion_streams_generated_tokens_and_done() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["cache-control"] == "no-cache"
+
+    assert tokenizer.encoded_prompts == ["Explain paged KV caching."]
 
     events = _sse_data_events(response)
 
@@ -56,7 +61,12 @@ async def test_completion_streams_generated_tokens_and_done() -> None:
     assert len(payloads) == 3
 
     assert [payload["choices"][0]["token_id"] for payload in payloads] == [5, 5, 5]
-
+    assert [payload["choices"][0]["cumulative_text"] for payload in payloads] == [
+        "5",
+        "55",
+        "555",
+    ]
+    assert tokenizer.decoded_token_ids == [(5,), (5, 5), (5, 5, 5)]
     assert [payload["choices"][0]["finish_reason"] for payload in payloads] == [
         None,
         None,
@@ -65,11 +75,87 @@ async def test_completion_streams_generated_tokens_and_done() -> None:
 
 
 @pytest.mark.anyio
+async def test_completion_accepts_pretokenized_prompt() -> None:
+    """Submit pre-tokenized input without invoking prompt encoding."""
+    engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
+
+    async with _gateway_client(engine, tokenizer) as client:
+        response = await client.post(
+            "/v1/completions",
+            json={
+                "model": "stub-model",
+                "prompt_token_ids": [1, 2, 3],
+                "max_tokens": 1,
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert tokenizer.encoded_prompts == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "prompt_fields",
+    [
+        {},
+        {
+            "prompt": "Hello",
+            "prompt_token_ids": [1, 2, 3],
+        },
+    ],
+)
+async def test_completion_requires_exactly_one_prompt_source(
+    prompt_fields: dict[str, object],
+) -> None:
+    """Reject requests with zero or multiple prompt representations."""
+    engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
+
+    async with _gateway_client(engine, tokenizer) as client:
+        response = await client.post(
+            "/v1/completions",
+            json={
+                "model": "stub-model",
+                "max_tokens": 1,
+                "stream": True,
+                **prompt_fields,
+            },
+        )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_completion_translates_blank_prompt_rejection_to_bad_request() -> None:
+    """Translate tokenizer rejection of a blank prompt into HTTP 400."""
+    engine = _test_engine()
+    tokenizer = FakeTextTokenizer(encode_error=ValueError("prompt must not be empty."))
+
+    async with _gateway_client(engine, tokenizer) as client:
+        response = await client.post(
+            "/v1/completions",
+            json={
+                "model": "stub-model",
+                "prompt": "   ",
+                "max_tokens": 1,
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "prompt must not be empty."
+    assert tokenizer.encoded_prompts == ["   "]
+
+
+@pytest.mark.anyio
 async def test_completion_rejects_non_streaming_request() -> None:
     """Reject completion requests when streaming is disabled."""
     engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
 
-    async with _gateway_client(engine) as client:
+    async with _gateway_client(engine, tokenizer) as client:
         response = await client.post(
             "/v1/completions",
             json={
@@ -88,8 +174,9 @@ async def test_completion_rejects_non_streaming_request() -> None:
 async def test_completion_rejects_invalid_http_payload() -> None:
     """Reject request payloads that violate the HTTP schema."""
     engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
 
-    async with _gateway_client(engine) as client:
+    async with _gateway_client(engine, tokenizer) as client:
         response = await client.post(
             "/v1/completions",
             json={
@@ -113,8 +200,9 @@ async def test_completion_translates_engine_rejection_to_bad_request() -> None:
         max_batched_tokens=4,
     )
     engine = _test_engine(configuration=configuration)
+    tokenizer = FakeTextTokenizer()
 
-    async with _gateway_client(engine) as client:
+    async with _gateway_client(engine, tokenizer) as client:
         response = await client.post(
             "/v1/completions",
             json={
@@ -189,6 +277,7 @@ async def test_stream_completion_cancels_request_when_consumer_closes() -> None:
     """Cancel unfinished engine work when the streaming consumer disconnects."""
     engine = _test_engine()
     broker = _EngineStreamBroker(engine)
+    tokenizer = FakeTextTokenizer()
 
     request = Request(
         request_id="request-1",
@@ -216,12 +305,16 @@ async def test_stream_completion_cancels_request_when_consumer_closes() -> None:
                 model_name="stub-model",
                 queue=queue,
                 broker=broker,
+                tokenizer=tokenizer,
             ),
         )
 
         first_chunk = await anext(stream)
 
         assert '"token_id": 5' in first_chunk
+        assert '"cumulative_text": "5"' in first_chunk
+        assert tokenizer.decoded_token_ids == [(5,)]
+
         assert sequence.finish_reason is None
 
         await stream.aclose()
@@ -269,9 +362,10 @@ async def test_broker_close_cancels_active_requests() -> None:
 @asynccontextmanager
 async def _gateway_client(
     engine: Engine,
+    tokenizer: TextTokenizer,
 ) -> AsyncIterator[httpx2.AsyncClient]:
     """Create an in-process HTTP client for a gateway application."""
-    application = create_gateway_app(engine)
+    application = create_gateway_app(engine, tokenizer)
 
     async with application.router.lifespan_context(application):
         transport = httpx2.ASGITransport(app=application)
