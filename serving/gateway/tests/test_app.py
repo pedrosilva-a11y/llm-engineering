@@ -167,6 +167,24 @@ async def test_broker_cancel_removes_stream_and_cancels_engine_request() -> None
 
 
 @pytest.mark.anyio
+async def test_broker_rejects_submission_after_close() -> None:
+    """Reject new requests after the broker has shut down."""
+    engine = _test_engine()
+    broker = _EngineStreamBroker(engine)
+
+    await broker.close()
+
+    request = Request(
+        request_id="request-1",
+        prompt_token_ids=(1, 2, 3),
+        max_new_tokens=1,
+    )
+
+    with pytest.raises(RuntimeError, match="engine stream broker is closed"):
+        broker.submit(request)
+
+
+@pytest.mark.anyio
 async def test_stream_completion_cancels_request_when_consumer_closes() -> None:
     """Cancel unfinished engine work when the streaming consumer disconnects."""
     engine = _test_engine()

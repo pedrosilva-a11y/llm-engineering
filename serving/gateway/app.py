@@ -11,9 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from serving.engine.config import EngineConfiguration
 from serving.engine.engine import Engine
-from serving.engine.model_runner import DeterministicStubModelRunner
 from serving.engine.request import Request
 from serving.engine.sequence import FinishReason, SequenceState
 
@@ -285,26 +283,3 @@ async def _stream_completion(
 
     finally:
         broker.cancel(request_id)
-
-
-def _create_default_engine() -> Engine:
-    """Create the CPU engine used by the development gateway."""
-    configuration = EngineConfiguration()
-
-    model_runner = DeterministicStubModelRunner(
-        vocab_size=32,
-        eos_token_id=configuration.eos_token_id,
-        generated_token_id=1,
-        # Keep EOS unreachable in normal development requests so max_tokens
-        # controls completion length deterministically.
-        default_eos_after=1_000_000,
-        device=configuration.device,
-    )
-
-    return Engine(
-        configuration=configuration,
-        model_runner=model_runner,
-    )
-
-
-app = create_gateway_app(_create_default_engine())
