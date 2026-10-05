@@ -3,6 +3,8 @@ import type { SubmitEvent } from 'react'
 
 import { streamCompletion } from './api/completions'
 
+import { AppHeader } from './components/AppHeader'
+
 import './App.css'
 
 const MODEL_NAME = 'Qwen/Qwen2.5-1.5B-Instruct'
@@ -71,47 +73,51 @@ function App() {
   }
 
   return (
-    <main className="app">
-      <header className="app__header">
-        <h1 className="app__title">LLM Inference Engine</h1>
-      </header>
+    <>
+      <AppHeader />
 
-      <form className="completion-form" onSubmit={handleSubmit}>
-        <textarea
-          className="completion-form__textarea"
-          value={prompt}
-          onChange={(event) => {
-            setPrompt(event.target.value)
-          }}
-          placeholder="Enter a prompt"
-          rows={6}
-        />
+      <main className="app">
+        <header className="app__header">
+          <h1 className="app__title">LLM Inference Engine</h1>
+        </header>
 
-        <div className="completion-form__actions">
-          <button
-            className="completion-form__button"
-            type="submit"
-            disabled={isGenerating}
-          >
-            {isGenerating ? 'Generating...' : 'Generate'}
-          </button>
+        <form className="completion-form" onSubmit={handleSubmit}>
+          <textarea
+            className="completion-form__textarea"
+            value={prompt}
+            onChange={(event) => {
+              setPrompt(event.target.value)
+            }}
+            placeholder="Enter a prompt"
+            rows={6}
+          />
 
-          {isGenerating && (
+          <div className="completion-form__actions">
             <button
-              className="completion-form__button completion-form__button--stop"
-              type="button"
-              onClick={handleStop}
+              className="completion-form__button"
+              type="submit"
+              disabled={isGenerating}
             >
-              Stop
+              {isGenerating ? 'Generating...' : 'Generate'}
             </button>
-          )}
-        </div>
-      </form>
 
-      {error !== null && <p className="app__error">{error}</p>}
+            {isGenerating && (
+              <button
+                className="completion-form__button completion-form__button--stop"
+                type="button"
+                onClick={handleStop}
+              >
+                Stop
+              </button>
+            )}
+          </div>
+        </form>
 
-      <pre className="completion-output">{output}</pre>
-    </main>
+        {error !== null && <p className="app__error">{error}</p>}
+
+        <pre className="completion-output">{output}</pre>
+      </main>
+    </>
   )
 }
 
