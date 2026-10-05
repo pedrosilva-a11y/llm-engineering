@@ -1,4 +1,6 @@
 .app {
+  display: grid;
+  gap: 2rem;
   width: min(100% - 3rem, 72rem);
   min-height: 100vh;
   margin: 0 auto;

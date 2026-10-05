@@ -1,5 +1,4 @@
-import { AppHeader } from './components/AppHeader'
-import { CompletionPanel } from './components/CompletionPanel'
+import { AppHeader, CompletionPanel, ConfigurationSelector } from './components'
 
 import './App.css'
 
@@ -9,6 +8,7 @@ function App() {
       <AppHeader />
 
       <main className="app">
+        <ConfigurationSelector />
         <CompletionPanel />
       </main>
     </>
