@@ -8,14 +8,46 @@ import './CompletionPanel.css'
 const MODEL_NAME = 'Qwen/Qwen2.5-1.5B-Instruct'
 const MAX_TOKENS = 128
 
+type RequestState =
+  'idle' | 'waiting' | 'generating' | 'completed' | 'cancelled' | 'error'
+
+interface CompletionMetrics {
+  tokenCount: number
+  clientObservedTtftMs: number | null
+  durationMs: number | null
+  tokensPerSecond: number | null
+}
+
+const INITIAL_METRICS: CompletionMetrics = {
+  tokenCount: 0,
+  clientObservedTtftMs: null,
+  durationMs: null,
+  tokensPerSecond: null,
+}
+
+const REQUEST_STATE_LABELS: Record<RequestState, string> = {
+  idle: 'Ready',
+  waiting: 'Waiting for first token',
+  generating: 'Generating',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+  error: 'Error',
+}
+
 export function CompletionPanel() {
   const [prompt, setPrompt] = useState('')
   const [output, setOutput] = useState('')
   const [error, setError] = useState<string | null>(null)
-  const [isGenerating, setIsGenerating] = useState(false)
+  const [requestState, setRequestState] = useState<RequestState>('idle')
+  const [metrics, setMetrics] = useState<CompletionMetrics>(INITIAL_METRICS)
 
+  const requestStartedAtRef = useRef<number | null>(null)
+  const firstTokenAtRef = useRef<number | null>(null)
+  const tokenCountRef = useRef(0)
   const abortControllerRef = useRef<AbortController | null>(null)
   const outputRef = useRef<HTMLDivElement | null>(null)
+
+  const isGenerating = requestState === 'waiting' || requestState === 'generating'
 
   useEffect(() => {
     if (!isGenerating || outputRef.current === null) {
@@ -46,13 +78,35 @@ export function CompletionPanel() {
     abortControllerRef.current?.abort()
   }
 
+  function finishRequestMetrics(): void {
+    const startedAt = requestStartedAtRef.current
+
+    if (startedAt === null) {
+      return
+    }
+
+    const durationMs = performance.now() - startedAt
+    const tokenCount = tokenCountRef.current
+
+    setMetrics((current) => ({
+      ...current,
+      durationMs,
+      tokensPerSecond: durationMs > 0 ? tokenCount / (durationMs / 1_000) : null,
+    }))
+  }
+
   async function generateCompletion(): Promise<void> {
     setOutput('')
     setError(null)
-    setIsGenerating(true)
+    setMetrics(INITIAL_METRICS)
+    setRequestState('waiting')
 
     const controller = new AbortController()
+
     abortControllerRef.current = controller
+    requestStartedAtRef.current = performance.now()
+    firstTokenAtRef.current = null
+    tokenCountRef.current = 0
 
     try {
       await streamCompletion(
@@ -63,7 +117,26 @@ export function CompletionPanel() {
           stream: true,
         },
         (chunk) => {
+          const now = performance.now()
           const cumulativeText = chunk.choices[0]?.cumulative_text
+
+          if (firstTokenAtRef.current === null) {
+            firstTokenAtRef.current = now
+            setRequestState('generating')
+          }
+
+          tokenCountRef.current += 1
+
+          const startedAt = requestStartedAtRef.current
+          const firstTokenAt = firstTokenAtRef.current
+
+          setMetrics((current) => ({
+            ...current,
+            tokenCount: tokenCountRef.current,
+            clientObservedTtftMs:
+              current.clientObservedTtftMs ??
+              (startedAt !== null ? firstTokenAt - startedAt : null),
+          }))
 
           if (cumulativeText !== undefined) {
             setOutput(cumulativeText)
@@ -71,11 +144,18 @@ export function CompletionPanel() {
         },
         controller.signal,
       )
+
+      finishRequestMetrics()
+      setRequestState('completed')
     } catch (caughtError: unknown) {
+      finishRequestMetrics()
+
       if (caughtError instanceof DOMException && caughtError.name === 'AbortError') {
+        setRequestState('cancelled')
         return
       }
 
+      setRequestState('error')
       setError(
         caughtError instanceof Error
           ? caughtError.message
@@ -83,7 +163,6 @@ export function CompletionPanel() {
       )
     } finally {
       abortControllerRef.current = null
-      setIsGenerating(false)
     }
   }
 
@@ -132,6 +211,40 @@ export function CompletionPanel() {
         </p>
       )}
 
+      <div className="completion-telemetry">
+        <span
+          className={`completion-telemetry__status completion-telemetry__status--${requestState}`}
+        >
+          {REQUEST_STATE_LABELS[requestState]}
+        </span>
+
+        <dl className="completion-telemetry__metrics">
+          <div>
+            <dt>Tokens</dt>
+            <dd>{metrics.tokenCount}</dd>
+          </div>
+
+          <div>
+            <dt>Client-observed TTFT</dt>
+            <dd>{formatMilliseconds(metrics.clientObservedTtftMs)}</dd>
+          </div>
+
+          <div>
+            <dt>Duration</dt>
+            <dd>{formatMilliseconds(metrics.durationMs)}</dd>
+          </div>
+
+          <div>
+            <dt>Observed tokens/s</dt>
+            <dd>
+              {metrics.tokensPerSecond === null
+                ? '—'
+                : metrics.tokensPerSecond.toFixed(1)}
+            </dd>
+          </div>
+        </dl>
+      </div>
+
       <div
         ref={outputRef}
         className="completion-output"
@@ -154,4 +267,12 @@ export function CompletionPanel() {
       </div>
     </section>
   )
+}
+
+function formatMilliseconds(value: number | null): string {
+  if (value === null) {
+    return '—'
+  }
+
+  return `${value.toFixed(value < 100 ? 1 : 0)} ms`
 }
