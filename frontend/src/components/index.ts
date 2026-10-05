@@ -1,4 +1,5 @@
 export { AppHeader } from './AppHeader'
 export { BackendStatus } from './BackendStatus'
 export { CompletionPanel } from './CompletionPanel'
+export { CompletionWorkspace } from './CompletionWorkspace'
 export { ConfigurationSelector } from './ConfigurationSelector'

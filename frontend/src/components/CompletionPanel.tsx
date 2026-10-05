@@ -18,6 +18,10 @@ interface CompletionMetrics {
   tokensPerSecond: number | null
 }
 
+interface CompletionPanelProps {
+  title: string
+}
+
 const INITIAL_METRICS: CompletionMetrics = {
   tokenCount: 0,
   clientObservedTtftMs: null,
@@ -34,7 +38,7 @@ const REQUEST_STATE_LABELS: Record<RequestState, string> = {
   error: 'Error',
 }
 
-export function CompletionPanel() {
+export function CompletionPanel({ title }: CompletionPanelProps) {
   const [prompt, setPrompt] = useState('')
   const [output, setOutput] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -169,7 +173,9 @@ export function CompletionPanel() {
   return (
     <section className="completion-panel">
       <header className="completion-panel__header">
-        <h1 className="completion-panel__title">LLM Inference Engine</h1>
+        <h2 className="completion-panel__title">{title}</h2>
+
+        <span className="completion-panel__stream-label">Independent stream</span>
       </header>
 
       <form className="completion-form" onSubmit={handleSubmit}>
