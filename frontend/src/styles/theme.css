@@ -1,24 +1,24 @@
 :root {
-    --color-black: #000000;
-    --color-white: #ffffff;
-    --color-blue: #0454f4;
-    --color-yellow: #f5a800;
+  --color-black: #000000;
+  --color-white: #ffffff;
+  --color-blue: #0454f4;
+  --color-yellow: #f5a800;
 
-    --color-slate-50: #f8fafc;
-    --color-slate-100: #f1f5f9;
-    --color-slate-200: #e2e8f0;
-    --color-slate-500: #64748b;
-    --color-slate-600: #475569;
-    --color-slate-900: #0f172a;
+  --color-slate-50: #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-900: #0f172a;
 
-    --color-background: var(--color-black);
-    --color-surface: #343541;
-    --color-text-primary: var(--color-white);
-    --color-text-secondary: rgb(255 255 255 / 68%);
-    --color-primary: var(--color-blue);
-    --color-accent: var(--color-yellow);
-    --color-border: rgb(255 255 255 / 14%);
+  --color-background: var(--color-black);
+  --color-surface: #343541;
+  --color-text-primary: var(--color-white);
+  --color-text-secondary: rgb(255 255 255 / 68%);
+  --color-primary: var(--color-blue);
+  --color-accent: var(--color-yellow);
+  --color-border: rgb(255 255 255 / 14%);
 
-    --radius-md: 0.875rem;
-    --radius-lg: 1.25rem;
+  --radius-md: 0.875rem;
+  --radius-lg: 1.25rem;
 }

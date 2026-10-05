@@ -3,6 +3,8 @@ import type { SubmitEvent } from 'react'
 
 import { streamCompletion } from './api/completions'
 
+import './App.css'
+
 const MODEL_NAME = 'Qwen/Qwen2.5-1.5B-Instruct'
 const MAX_TOKENS = 128
 
@@ -69,11 +71,14 @@ function App() {
   }
 
   return (
-    <main>
-      <h1>LLM Inference Engine</h1>
+    <main className="app">
+      <header className="app__header">
+        <h1 className="app__title">LLM Inference Engine</h1>
+      </header>
 
-      <form onSubmit={handleSubmit}>
+      <form className="completion-form" onSubmit={handleSubmit}>
         <textarea
+          className="completion-form__textarea"
           value={prompt}
           onChange={(event) => {
             setPrompt(event.target.value)
@@ -82,20 +87,30 @@ function App() {
           rows={6}
         />
 
-        <button type="submit" disabled={isGenerating}>
-          {isGenerating ? 'Generating...' : 'Generate'}
-        </button>
-
-        {isGenerating && (
-          <button type="button" onClick={handleStop}>
-            Stop
+        <div className="completion-form__actions">
+          <button
+            className="completion-form__button"
+            type="submit"
+            disabled={isGenerating}
+          >
+            {isGenerating ? 'Generating...' : 'Generate'}
           </button>
-        )}
+
+          {isGenerating && (
+            <button
+              className="completion-form__button completion-form__button--stop"
+              type="button"
+              onClick={handleStop}
+            >
+              Stop
+            </button>
+          )}
+        </div>
       </form>
 
-      {error !== null && <p>{error}</p>}
+      {error !== null && <p className="app__error">{error}</p>}
 
-      <pre>{output}</pre>
+      <pre className="completion-output">{output}</pre>
     </main>
   )
 }
