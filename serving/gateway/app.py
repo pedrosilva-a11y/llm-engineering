@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
+from serving.cost_models.catalog import HARDWARE_CATALOG, MODEL_CATALOG
 from serving.engine.engine import Engine
 from serving.engine.request import Request
 from serving.engine.sequence import FinishReason, SequenceState
@@ -28,6 +29,63 @@ class HealthResponse(BaseModel):
 
     status: Literal["ok"]
     service: str
+
+
+class ModelCatalogEntry(BaseModel):
+    """Model specification exposed through the gateway catalog.
+
+    Attributes:
+        name: Stable identifier for the model specification.
+        n_layer: Number of transformer layers.
+        d_model: Hidden-state dimensionality of the model.
+        n_head: Number of attention heads.
+        n_kv_head: Number of key-value attention heads.
+        d_head: Dimensionality of each attention head.
+        d_ff: Hidden dimensionality of the feed-forward network.
+        vocab_size: Number of tokens in the model vocabulary.
+        tied_embeddings: Whether input and output embedding weights are shared.
+        norm_has_bias: Whether normalization layers include bias parameters.
+    """
+
+    name: str
+    n_layer: int
+    d_model: int
+    n_head: int
+    n_kv_head: int
+    d_head: int
+    d_ff: int
+    vocab_size: int
+    tied_embeddings: bool
+    norm_has_bias: bool
+
+
+class HardwareCatalogEntry(BaseModel):
+    """Hardware specification exposed through the gateway catalog.
+
+    Attributes:
+        name: Stable identifier for the hardware specification.
+        peak_bf16_tflops: Peak BF16 compute throughput in tera floating-point
+            operations per second.
+        memory_bandwidth_tb_s: Peak memory bandwidth in terabytes per second.
+        memory_capacity_gib: Available accelerator memory capacity in gibibytes.
+    """
+
+    name: str
+    peak_bf16_tflops: float
+    memory_bandwidth_tb_s: float
+    memory_capacity_gib: float
+
+
+class CatalogResponse(BaseModel):
+    """Available model and hardware specifications.
+
+    Attributes:
+        models: Model specifications available in the catalog.
+        hardware: Hardware specifications available in the catalog.
+    """
+
+    models: list[ModelCatalogEntry]
+    hardware: list[HardwareCatalogEntry]
 
 
 class CompletionRequest(BaseModel):
@@ -219,7 +277,7 @@ def create_gateway_app(engine: Engine, tokenizer: TextTokenizer) -> FastAPI:
         tokenizer: Text tokenizer used to encode prompts and decode generated tokens.
 
     Returns:
-        FastAPI application exposing the completions endpoint.
+        FastAPI application exposing the inference gateway endpoints.
     """
     broker = _EngineStreamBroker(engine)
 
@@ -243,6 +301,40 @@ def create_gateway_app(engine: Engine, tokenizer: TextTokenizer) -> FastAPI:
         return HealthResponse(
             status="ok",
             service="llm-inference-gateway",
+        )
+
+    @application.get("/v1/catalog", response_model=CatalogResponse)
+    async def get_catalog() -> CatalogResponse:
+        """Return model and hardware specifications available to the application.
+
+        Returns:
+            Catalog response containing the available model and hardware specifications.
+        """
+        return CatalogResponse(
+            models=[
+                ModelCatalogEntry(
+                    name=model.name,
+                    n_layer=model.n_layer,
+                    d_model=model.d_model,
+                    n_head=model.n_head,
+                    n_kv_head=model.n_kv_head,
+                    d_head=model.d_head,
+                    d_ff=model.d_ff,
+                    vocab_size=model.vocab_size,
+                    tied_embeddings=model.tied_embeddings,
+                    norm_has_bias=model.norm_has_bias,
+                )
+                for model in MODEL_CATALOG.values()
+            ],
+            hardware=[
+                HardwareCatalogEntry(
+                    name=hardware.name,
+                    peak_bf16_tflops=hardware.peak_bf16_tflops,
+                    memory_bandwidth_tb_s=hardware.memory_bandwidth_tb_s,
+                    memory_capacity_gib=hardware.memory_capacity_gib,
+                )
+                for hardware in HARDWARE_CATALOG.values()
+            ],
         )
 
     @application.post("/v1/completions")

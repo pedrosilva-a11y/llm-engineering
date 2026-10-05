@@ -46,6 +46,35 @@ async def test_health_reports_gateway_available() -> None:
 
 
 @pytest.mark.anyio
+async def test_catalog_reports_available_models_and_hardware() -> None:
+    """Expose known model and hardware specifications."""
+    engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
+
+    async with _gateway_client(engine, tokenizer) as client:
+        response = await client.get("/v1/catalog")
+
+    assert response.status_code == 200
+
+    payload = response.json()
+
+    assert {model["name"] for model in payload["models"]} == {
+        "llama-3-8b",
+        "qwen2.5-1.5b",
+        "toy-decoder-model",
+    }
+    assert {hardware["name"] for hardware in payload["hardware"]} == {
+        "L4",
+        "H100-SXM",
+    }
+
+    qwen = next(model for model in payload["models"] if model["name"] == "qwen2.5-1.5b")
+
+    assert qwen["n_layer"] == 28
+    assert qwen["d_model"] == 1_536
+
+
+@pytest.mark.anyio
 async def test_completion_streams_cumulative_text_and_done() -> None:
     """Tokenize a text prompt and stream cumulative decoded text."""
     engine = _test_engine()
