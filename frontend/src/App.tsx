@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import type { SubmitEvent } from 'react'
 
 import { streamCompletion } from './api/completions'
@@ -11,6 +11,7 @@ function App() {
   const [output, setOutput] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -22,10 +23,17 @@ function App() {
     void generateCompletion()
   }
 
+  function handleStop() {
+    abortControllerRef.current?.abort()
+  }
+
   async function generateCompletion(): Promise<void> {
     setOutput('')
     setError(null)
     setIsGenerating(true)
+
+    const controller = new AbortController()
+    abortControllerRef.current = controller
 
     try {
       await streamCompletion(
@@ -42,14 +50,20 @@ function App() {
             setOutput(cumulativeText)
           }
         },
+        controller.signal,
       )
     } catch (caughtError: unknown) {
+      if (caughtError instanceof DOMException && caughtError.name === 'AbortError') {
+        return
+      }
+
       setError(
         caughtError instanceof Error
           ? caughtError.message
           : 'An unexpected error occurred.',
       )
     } finally {
+      abortControllerRef.current = null
       setIsGenerating(false)
     }
   }
@@ -71,6 +85,12 @@ function App() {
         <button type="submit" disabled={isGenerating}>
           {isGenerating ? 'Generating...' : 'Generate'}
         </button>
+
+        {isGenerating && (
+          <button type="button" onClick={handleStop}>
+            Stop
+          </button>
+        )}
       </form>
 
       {error !== null && <p>{error}</p>}
