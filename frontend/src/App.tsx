@@ -8,8 +8,8 @@ function App() {
       <AppHeader />
 
       <main className="app">
-        <ConfigurationSelector />
         <CompletionPanel />
+        <ConfigurationSelector />
       </main>
     </>
   )
