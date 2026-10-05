@@ -22,5 +22,5 @@
 }
 
 .backend-status--offline .backend-status__dot {
-  background: #ef4444;
+  background: var(--color-danger);
 }

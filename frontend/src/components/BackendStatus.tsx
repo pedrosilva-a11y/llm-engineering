@@ -4,7 +4,7 @@ import { getBackendHealth } from '../api/health'
 
 import './BackendStatus.css'
 
-const POLL_INTERVAL = 10_000
+const POLL_INTERVAL_MS = 10_000
 type BackendState = 'checking' | 'online' | 'offline'
 
 export function BackendStatus() {
@@ -34,7 +34,7 @@ export function BackendStatus() {
 
     const intervalId = window.setInterval(() => {
       void checkBackend()
-    }, POLL_INTERVAL)
+    }, POLL_INTERVAL_MS)
 
     return () => {
       isMounted = false

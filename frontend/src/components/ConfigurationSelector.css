@@ -129,7 +129,7 @@
 }
 
 .configuration-selector__error {
-  color: #fecaca;
+  color: var(--color-danger-text);
   font-weight: 600;
 }
 

@@ -1,3 +1,7 @@
+.completion-panel {
+  min-width: 0;
+}
+
 .completion-panel__header {
   display: flex;
   align-items: center;
@@ -89,7 +93,7 @@
 
 .completion-panel__error {
   margin: 1rem 0 0;
-  color: #fecaca;
+  color: var(--color-danger-text);
   font-weight: 600;
 }
 
@@ -126,7 +130,7 @@
 }
 
 .completion-telemetry__status--error {
-  color: #fecaca;
+  color: var(--color-danger-text);
 }
 
 .completion-telemetry__metrics {
