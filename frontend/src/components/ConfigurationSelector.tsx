@@ -73,12 +73,13 @@ export function ConfigurationSelector() {
     <section className="configuration-selector" aria-labelledby="configuration-title">
       <div className="configuration-selector__header">
         <div>
-          <p className="configuration-selector__eyebrow">Configuration</p>
-          <h2 id="configuration-title">Target model and hardware</h2>
+          <p className="configuration-selector__eyebrow">Cost model</p>
+          <h2 id="configuration-title">Analytical target configuration</h2>
         </div>
 
         <p className="configuration-selector__description">
-          Select catalog specifications for the target inference configuration.
+          Select model and hardware specifications for analytical cost and roofline
+          modeling. This does not change the active inference runtime.
         </p>
       </div>
 
