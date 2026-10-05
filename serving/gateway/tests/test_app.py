@@ -30,6 +30,22 @@ def anyio_backend() -> str:
 
 
 @pytest.mark.anyio
+async def test_health_reports_gateway_available() -> None:
+    """Report that the inference gateway is available."""
+    engine = _test_engine()
+    tokenizer = FakeTextTokenizer()
+
+    async with _gateway_client(engine, tokenizer) as client:
+        response = await client.get("/v1/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "service": "llm-inference-gateway",
+    }
+
+
+@pytest.mark.anyio
 async def test_completion_streams_cumulative_text_and_done() -> None:
     """Tokenize a text prompt and stream cumulative decoded text."""
     engine = _test_engine()

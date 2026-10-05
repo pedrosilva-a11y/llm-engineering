@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import Self
+from typing import Literal, Self
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -16,6 +16,18 @@ from serving.engine.engine import Engine
 from serving.engine.request import Request
 from serving.engine.sequence import FinishReason, SequenceState
 from serving.gateway.tokenizer import TextTokenizer
+
+
+class HealthResponse(BaseModel):
+    """Health status returned by the inference gateway.
+
+    Attributes:
+        status: Current gateway health state.
+        service: Stable identifier for the gateway service.
+    """
+
+    status: Literal["ok"]
+    service: str
 
 
 class CompletionRequest(BaseModel):
@@ -220,6 +232,18 @@ def create_gateway_app(engine: Engine, tokenizer: TextTokenizer) -> FastAPI:
             await broker.close()
 
     application = FastAPI(lifespan=lifespan)
+
+    @application.get("/v1/health", response_model=HealthResponse)
+    async def get_health() -> HealthResponse:
+        """Report whether the inference gateway is available.
+
+        Returns:
+            Health response describing the gateway availability and service identifier.
+        """
+        return HealthResponse(
+            status="ok",
+            service="llm-inference-gateway",
+        )
 
     @application.post("/v1/completions")
     async def create_completion(
