@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react'
-import type { SubmitEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { KeyboardEvent, SubmitEvent } from 'react'
 
 import { streamCompletion } from '../api/completions'
 
@@ -13,7 +13,17 @@ export function CompletionPanel() {
   const [output, setOutput] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
+
   const abortControllerRef = useRef<AbortController | null>(null)
+  const outputRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!isGenerating || outputRef.current === null) {
+      return
+    }
+
+    outputRef.current.scrollTop = outputRef.current.scrollHeight
+  }, [output, isGenerating])
 
   function handleSubmit(event: SubmitEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -23,6 +33,13 @@ export function CompletionPanel() {
     }
 
     void generateCompletion()
+  }
+
+  function handlePromptKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !isGenerating) {
+      event.preventDefault()
+      event.currentTarget.form?.requestSubmit()
+    }
   }
 
   function handleStop() {
@@ -83,8 +100,9 @@ export function CompletionPanel() {
           onChange={(event) => {
             setPrompt(event.target.value)
           }}
+          onKeyDown={handlePromptKeyDown}
           placeholder="Enter a prompt"
-          rows={6}
+          aria-label="Completion prompt"
         />
 
         <div className="completion-form__actions">
@@ -108,9 +126,32 @@ export function CompletionPanel() {
         </div>
       </form>
 
-      {error !== null && <p className="completion-panel__error">{error}</p>}
+      {error !== null && (
+        <p className="completion-panel__error" role="alert">
+          {error}
+        </p>
+      )}
 
-      <pre className="completion-output">{output}</pre>
+      <div
+        ref={outputRef}
+        className="completion-output"
+        aria-live="polite"
+        aria-busy={isGenerating}
+      >
+        {output !== '' ? (
+          <span>{output}</span>
+        ) : (
+          <span className="completion-output__placeholder">
+            {isGenerating
+              ? 'Waiting for first token...'
+              : 'Generated text will stream here.'}
+          </span>
+        )}
+
+        {isGenerating && (
+          <span className="completion-output__cursor" aria-hidden="true" />
+        )}
+      </div>
     </section>
   )
 }
