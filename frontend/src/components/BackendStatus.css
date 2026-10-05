@@ -1,0 +1,26 @@
+.backend-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  color: var(--color-text-secondary);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.backend-status__dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--color-slate-500);
+}
+
+.backend-status--online .backend-status__dot {
+  background: var(--color-primary);
+}
+
+.backend-status--offline .backend-status__dot {
+  background: #ef4444;
+}
