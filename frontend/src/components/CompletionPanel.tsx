@@ -8,7 +8,7 @@ import { streamCompletion } from '../api/completions'
 import './CompletionPanel.css'
 
 const MODEL_NAME = 'Qwen/Qwen2.5-1.5B-Instruct'
-const MAX_TOKENS = 128
+const MAX_TOKENS = 256
 
 type RequestState =
   'idle' | 'waiting' | 'generating' | 'completed' | 'cancelled' | 'error'
