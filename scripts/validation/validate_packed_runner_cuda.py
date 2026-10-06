@@ -17,14 +17,14 @@ from serving.engine.sequence import SequenceState
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 
-DTYPE = torch.float16
+DTYPE = torch.bfloat16
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
 TOTAL_SLOTS = NUM_BLOCKS * BLOCK_SIZE
 
 
 def load_model(device: torch.device) -> PreTrainedModel:
-    """Load the frozen Qwen checkpoint using eager attention."""
+    """Load the frozen Qwen checkpoint with the configured validation dtype and SDPA."""
     model_factory: Any = AutoModelForCausalLM
 
     loaded_model: Any = model_factory.from_pretrained(
@@ -32,6 +32,7 @@ def load_model(device: torch.device) -> PreTrainedModel:
         revision=REVISION,
         dtype=DTYPE,
         attn_implementation="sdpa",
+        trust_remote_code=False,
     )
     loaded_model = loaded_model.to(device)
 
@@ -346,6 +347,9 @@ def main() -> None:
     """Run the CUDA packed-runner differential validation."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA validation requires a CUDA GPU.")
+
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("BF16 validation requires a CUDA device with BF16 support.")
 
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
