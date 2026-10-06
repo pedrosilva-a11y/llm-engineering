@@ -17,7 +17,7 @@ from serving.engine.sequence import SequenceState
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 
-DTYPE = torch.bfloat16
+DTYPE = torch.float32
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8
 TOTAL_SLOTS = NUM_BLOCKS * BLOCK_SIZE
