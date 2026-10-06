@@ -12,6 +12,7 @@ from serving.engine.model_runner import DeterministicStubModelRunner
 from serving.engine.paged_kv_cache import PagedKVCache
 from serving.engine.paged_kv_storage import PagedKVStorage
 from serving.engine.paged_model_runner import PagedModelRunner
+from serving.engine.request import Request
 from serving.gateway.app import create_gateway_app
 from serving.gateway.tokenizer import (
     QWEN_MODEL_NAME,
@@ -93,6 +94,7 @@ def create_gpu_engine() -> Engine:
             QWEN_MODEL_NAME,
             revision=QWEN_MODEL_REVISION,
             dtype=torch.bfloat16,
+            attn_implementation="sdpa",
             trust_remote_code=False,
         ),
     )
@@ -104,6 +106,10 @@ def create_gpu_engine() -> Engine:
     configuration = EngineConfiguration(
         device=str(device),
         eos_token_id=eos_token_id,
+        max_sequences=8,
+        block_size=16,
+        num_blocks=256,
+        max_batched_tokens=2_048,
     )
 
     storage = PagedKVStorage(
@@ -122,6 +128,13 @@ def create_gpu_engine() -> Engine:
         model=model,
         device=device,
         paged_cache=paged_cache,
+    )
+
+    # The warm-up and production engines share physical KV storage. Stale warm-up
+    # values are safe because prefill overwrites every allocated slot before gather.
+    _warm_up_gpu_runtime(
+        configuration=configuration,
+        model_runner=model_runner,
     )
 
     return Engine(
@@ -148,6 +161,39 @@ def create_gpu_app(*, tokenizer: TextTokenizer | None = None) -> FastAPI:
         engine=create_gpu_engine(),
         tokenizer=gateway_tokenizer,
     )
+
+
+def _warm_up_gpu_runtime(
+    *,
+    configuration: EngineConfiguration,
+    model_runner: PagedModelRunner,
+) -> None:
+    """Warm the CUDA model-execution path before serving user requests.
+
+    A temporary inference engine runs a small synthetic generation through the
+    production model runner. This initializes lazy CUDA and model execution state
+    before the application begins handling user traffic while leaving the
+    production engine with fresh scheduler and request state.
+
+    Args:
+        configuration: GPU engine configuration used to construct the temporary
+            warm-up engine.
+        model_runner: CUDA-backed paged model runner to exercise during warm-up.
+    """
+    warmup_engine = Engine(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    warmup_engine.submit(
+        Request(
+            request_id="gpu-warmup",
+            prompt_token_ids=(0,) * 64,
+            max_new_tokens=2,
+        )
+    )
+
+    warmup_engine.run_until_complete()
 
 
 def _positive_model_config_int(

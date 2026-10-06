@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from typing import cast
 
 import httpx2
 import pytest
@@ -15,6 +16,7 @@ from serving.engine.model_runner import (
     ModelRunner,
 )
 from serving.engine.paged_model_runner import PagedModelRunner
+from serving.engine.request import Request
 from serving.gateway.tests.helpers import FakeTextTokenizer
 from serving.gateway.tokenizer import QWEN_MODEL_NAME, QWEN_MODEL_REVISION
 
@@ -185,6 +187,70 @@ def test_create_gpu_engine_rejects_missing_bf16(
         runtime.create_gpu_engine()
 
 
+def test_warm_up_gpu_runtime_runs_synthetic_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run an isolated synthetic request through the GPU model runner."""
+    configuration = EngineConfiguration(
+        device="cuda",
+        eos_token_id=151_645,
+    )
+    model_runner = cast(PagedModelRunner, object())
+
+    class _RecordingWarmupEngine:
+        """Record warm-up engine interactions without executing CUDA."""
+
+        def __init__(
+            self,
+            configuration: EngineConfiguration,
+            model_runner: ModelRunner,
+        ) -> None:
+            """Record the supplied warm-up engine dependencies."""
+            self.configuration = configuration
+            self.model_runner = model_runner
+            self.submitted_requests: list[Request] = []
+            self.did_run_until_complete = False
+
+            engine_instances.append(self)
+
+        def submit(self, request: Request) -> None:
+            """Record the submitted warm-up request."""
+            self.submitted_requests.append(request)
+
+        def run_until_complete(self) -> None:
+            """Record execution of the warm-up generation."""
+            self.did_run_until_complete = True
+
+    engine_instances: list[_RecordingWarmupEngine] = []
+
+    monkeypatch.setattr(
+        runtime,
+        "Engine",
+        _RecordingWarmupEngine,
+    )
+
+    runtime._warm_up_gpu_runtime(
+        configuration=configuration,
+        model_runner=model_runner,
+    )
+
+    assert len(engine_instances) == 1
+
+    warmup_engine = engine_instances[0]
+
+    assert warmup_engine.configuration is configuration
+    assert warmup_engine.model_runner is model_runner
+
+    assert len(warmup_engine.submitted_requests) == 1
+
+    warmup_request = warmup_engine.submitted_requests[0]
+
+    assert warmup_request.request_id == "gpu-warmup"
+    assert warmup_request.prompt_token_ids == (0,) * 64
+    assert warmup_request.max_new_tokens == 2
+    assert warmup_engine.did_run_until_complete
+
+
 def test_create_gpu_engine_uses_paged_qwen_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -192,6 +258,7 @@ def test_create_gpu_engine_uses_paged_qwen_runtime(
     fake_model = _FakeCausalModel()
     storage_instances: list[_FakePagedKVStorage] = []
     model_load_calls: list[tuple[str, dict[str, object]]] = []
+    warmup_calls: list[tuple[EngineConfiguration, PagedModelRunner]] = []
 
     class _FakeAutoModelForCausalLM:
         """Record model-loading requests."""
@@ -228,6 +295,14 @@ def test_create_gpu_engine_uses_paged_qwen_runtime(
             )
             storage_instances.append(self)
 
+    def record_warmup(
+        *,
+        configuration: EngineConfiguration,
+        model_runner: PagedModelRunner,
+    ) -> None:
+        """Record GPU warm-up dependencies without executing inference."""
+        warmup_calls.append((configuration, model_runner))
+
     monkeypatch.setattr(
         torch.cuda,
         "is_available",
@@ -253,11 +328,20 @@ def test_create_gpu_engine_uses_paged_qwen_runtime(
         "Engine",
         _FakeEngine,
     )
+    monkeypatch.setattr(
+        runtime,
+        "_warm_up_gpu_runtime",
+        record_warmup,
+    )
 
     engine = runtime.create_gpu_engine()
 
     assert engine.configuration.device == "cuda"
     assert engine.configuration.eos_token_id == fake_model.config.eos_token_id
+    assert engine.configuration.max_sequences == 8
+    assert engine.configuration.block_size == 16
+    assert engine.configuration.num_blocks == 256
+    assert engine.configuration.max_batched_tokens == 2_048
 
     assert isinstance(engine.model_runner, PagedModelRunner)
 
@@ -271,6 +355,7 @@ def test_create_gpu_engine_uses_paged_qwen_runtime(
     assert model_name == QWEN_MODEL_NAME
     assert model_load_kwargs["revision"] == QWEN_MODEL_REVISION
     assert model_load_kwargs["dtype"] == torch.bfloat16
+    assert model_load_kwargs["attn_implementation"] == "sdpa"
     assert model_load_kwargs["trust_remote_code"] is False
 
     assert len(storage_instances) == 1
@@ -284,6 +369,13 @@ def test_create_gpu_engine_uses_paged_qwen_runtime(
     assert storage.head_dim == fake_model.config.head_dim
     assert storage.dtype == torch.bfloat16
     assert storage.device == torch.device("cuda")
+
+    assert len(warmup_calls) == 1
+
+    warmup_configuration, warmup_model_runner = warmup_calls[0]
+
+    assert warmup_configuration is engine.configuration
+    assert warmup_model_runner is engine.model_runner
 
 
 @pytest.mark.anyio
