@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent, SubmitEvent } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 import { streamCompletion } from '../api/completions'
 
@@ -273,7 +275,9 @@ export function CompletionPanel({ title }: CompletionPanelProps) {
         aria-busy={isGenerating}
       >
         {output !== '' ? (
-          <span>{output}</span>
+          <div className="completion-output__markdown">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{output}</ReactMarkdown>
+          </div>
         ) : (
           <span className="completion-output__placeholder">
             {isGenerating

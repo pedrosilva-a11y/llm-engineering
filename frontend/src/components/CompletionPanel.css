@@ -171,8 +171,81 @@
   background: rgb(255 255 255 / 4%);
   color: var(--color-text-primary);
   line-height: 1.7;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.completion-output__markdown > :first-child {
+  margin-top: 0;
+}
+
+.completion-output__markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.completion-output__markdown p {
+  margin: 0 0 1rem;
+}
+
+.completion-output__markdown ul,
+.completion-output__markdown ol {
+  margin: 0 0 1rem;
+  padding-left: 1.5rem;
+}
+
+.completion-output__markdown li + li {
+  margin-top: 0.35rem;
+}
+
+.completion-output__markdown table {
+  width: 100%;
+  margin: 0 0 1rem;
+  border-collapse: collapse;
+}
+
+.completion-output__markdown th,
+.completion-output__markdown td {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--color-border);
+  text-align: left;
+}
+
+.completion-output__markdown th {
+  font-weight: 700;
+}
+
+.completion-output__markdown strong {
+  font-weight: 700;
+}
+
+.completion-output__markdown code {
+  padding: 0.15rem 0.35rem;
+  border-radius: 0.35rem;
+  background: rgb(255 255 255 / 8%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.completion-output__markdown pre {
+  overflow-x: auto;
+  padding: 1rem;
+  border-radius: var(--radius-md);
+  background: rgb(0 0 0 / 30%);
+}
+
+.completion-output__markdown pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.completion-output__markdown blockquote {
+  margin: 0 0 1rem;
+  padding-left: 1rem;
+  border-left: 3px solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.completion-output__markdown a {
+  color: var(--color-primary);
 }
 
 .completion-output__placeholder {
