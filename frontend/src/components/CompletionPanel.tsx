@@ -15,7 +15,7 @@ interface CompletionMetrics {
   tokenCount: number
   clientObservedTtftMs: number | null
   durationMs: number | null
-  tokensPerSecond: number | null
+  decodeTokensPerSecond: number | null
 }
 
 interface CompletionPanelProps {
@@ -26,7 +26,7 @@ const INITIAL_METRICS: CompletionMetrics = {
   tokenCount: 0,
   clientObservedTtftMs: null,
   durationMs: null,
-  tokensPerSecond: null,
+  decodeTokensPerSecond: null,
 }
 
 const REQUEST_STATE_LABELS: Record<RequestState, string> = {
@@ -47,6 +47,7 @@ export function CompletionPanel({ title }: CompletionPanelProps) {
 
   const requestStartedAtRef = useRef<number | null>(null)
   const firstTokenAtRef = useRef<number | null>(null)
+  const lastTokenAtRef = useRef<number | null>(null)
   const tokenCountRef = useRef(0)
   const abortControllerRef = useRef<AbortController | null>(null)
   const outputRef = useRef<HTMLDivElement | null>(null)
@@ -89,13 +90,24 @@ export function CompletionPanel({ title }: CompletionPanelProps) {
       return
     }
 
-    const durationMs = performance.now() - startedAt
+    const finishedAt = performance.now()
+    const durationMs = finishedAt - startedAt
+    const firstTokenAt = firstTokenAtRef.current
+    const lastTokenAt = lastTokenAtRef.current
     const tokenCount = tokenCountRef.current
+
+    const decodeTokensPerSecond =
+      firstTokenAt !== null &&
+      lastTokenAt !== null &&
+      tokenCount > 1 &&
+      lastTokenAt > firstTokenAt
+        ? (tokenCount - 1) / ((lastTokenAt - firstTokenAt) / 1_000)
+        : null
 
     setMetrics((current) => ({
       ...current,
       durationMs,
-      tokensPerSecond: durationMs > 0 ? tokenCount / (durationMs / 1_000) : null,
+      decodeTokensPerSecond,
     }))
   }
 
@@ -110,6 +122,7 @@ export function CompletionPanel({ title }: CompletionPanelProps) {
     abortControllerRef.current = controller
     requestStartedAtRef.current = performance.now()
     firstTokenAtRef.current = null
+    lastTokenAtRef.current = null
     tokenCountRef.current = 0
 
     try {
@@ -123,6 +136,8 @@ export function CompletionPanel({ title }: CompletionPanelProps) {
         (chunk) => {
           const now = performance.now()
           const cumulativeText = chunk.choices[0]?.cumulative_text
+
+          lastTokenAtRef.current = now
 
           if (firstTokenAtRef.current === null) {
             firstTokenAtRef.current = now
@@ -241,11 +256,11 @@ export function CompletionPanel({ title }: CompletionPanelProps) {
           </div>
 
           <div>
-            <dt>Observed tokens/s</dt>
+            <dt>Decode tokens/s</dt>
             <dd>
-              {metrics.tokensPerSecond === null
+              {metrics.decodeTokensPerSecond === null
                 ? '—'
-                : metrics.tokensPerSecond.toFixed(1)}
+                : metrics.decodeTokensPerSecond.toFixed(1)}
             </dd>
           </div>
         </dl>
