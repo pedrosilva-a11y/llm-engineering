@@ -10,13 +10,14 @@ class WorkloadSpecification:
 
     Attributes:
         request_count: Number of requests generated for the workload.
-        prompt_token_ids: Prompt token identifiers shared by generated requests.
+        prompt_token_ids_by_request: Tokenized prompts available to generated requests.
+            Prompts are assigned deterministically by request index.
         max_tokens: Maximum number of output tokens requested per completion.
         request_id_prefix: Prefix used to generate deterministic request IDs.
     """
 
     request_count: int
-    prompt_token_ids: tuple[int, ...]
+    prompt_token_ids_by_request: tuple[tuple[int, ...], ...]
     max_tokens: int
     request_id_prefix: str = "request"
 
@@ -25,12 +26,26 @@ class WorkloadSpecification:
         if self.request_count <= 0:
             raise ValueError("request_count must be greater than zero.")
 
-        if not self.prompt_token_ids:
-            raise ValueError("prompt_token_ids must not be empty.")
+        if not self.prompt_token_ids_by_request:
+            raise ValueError("prompt_token_ids_by_request must not be empty.")
 
-        if any(token_id < 0 for token_id in self.prompt_token_ids):
+        if self.request_count > len(self.prompt_token_ids_by_request):
             raise ValueError(
-                "prompt_token_ids must contain only non-negative token IDs.",
+                "request_count must not exceed the number of available prompts.",
+            )
+
+        if any(not prompt for prompt in self.prompt_token_ids_by_request):
+            raise ValueError(
+                "prompt_token_ids_by_request must not contain empty prompts.",
+            )
+
+        if any(
+            token_id < 0
+            for prompt in self.prompt_token_ids_by_request
+            for token_id in prompt
+        ):
+            raise ValueError(
+                "prompt_token_ids_by_request must contain only non-negative token IDs.",
             )
 
         if self.max_tokens <= 0:
@@ -162,7 +177,7 @@ def _build_request(
     """Build the deterministic benchmark request."""
     return WorkloadRequest(
         request_id=f"{specification.request_id_prefix}-{request_index:06d}",
-        prompt_token_ids=specification.prompt_token_ids,
+        prompt_token_ids=specification.prompt_token_ids_by_request[request_index],
         max_tokens=specification.max_tokens,
         arrival_offset_seconds=arrival_offset_seconds,
     )

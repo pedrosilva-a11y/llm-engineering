@@ -324,7 +324,9 @@ def _build_workload(
     """Generate the workload selected by CLI arguments."""
     specification = WorkloadSpecification(
         request_count=arguments.request_count,
-        prompt_token_ids=arguments.prompt_token_ids,
+        prompt_token_ids_by_request=tuple(
+            arguments.prompt_token_ids for _ in range(arguments.request_count)
+        ),
         max_tokens=arguments.max_tokens,
     )
 

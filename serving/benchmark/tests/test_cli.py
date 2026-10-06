@@ -193,6 +193,11 @@ def test_build_workload_generates_fixed_arrivals() -> None:
     workload = _build_workload(arguments)
 
     assert len(workload) == 3
+    assert (
+        tuple(request.prompt_token_ids for request in workload)
+        == (arguments.prompt_token_ids,) * arguments.request_count
+    )
+
     assert all(request.arrival_offset_seconds == 0.0 for request in workload)
 
 
@@ -208,6 +213,11 @@ def test_build_workload_generates_poisson_arrivals() -> None:
     workload = _build_workload(arguments)
 
     assert len(workload) == 3
+    assert (
+        tuple(request.prompt_token_ids for request in workload)
+        == (arguments.prompt_token_ids,) * arguments.request_count
+    )
+
     assert workload[0].arrival_offset_seconds == 0.0
     assert workload[1].arrival_offset_seconds > 0.0
     assert workload[2].arrival_offset_seconds >= workload[1].arrival_offset_seconds

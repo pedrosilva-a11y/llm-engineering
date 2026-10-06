@@ -16,22 +16,24 @@ from serving.benchmark.workload import (
     (
         "field_name",
         "request_count",
-        "prompt_token_ids",
+        "prompt_token_ids_by_request",
         "max_tokens",
         "request_id_prefix",
     ),
     (
-        ("request_count", 0, (1, 2), 4, "request"),
-        ("prompt_token_ids", 2, (), 4, "request"),
-        ("prompt_token_ids", 2, (1, -1), 4, "request"),
-        ("max_tokens", 2, (1, 2), 0, "request"),
-        ("request_id_prefix", 2, (1, 2), 4, ""),
+        ("request_count", 0, ((1, 2),), 4, "request"),
+        ("prompt_token_ids_by_request", 1, (), 4, "request"),
+        ("prompt_token_ids_by_request", 1, ((),), 4, "request"),
+        ("prompt_token_ids_by_request", 1, ((1, -1),), 4, "request"),
+        ("request_count", 2, ((1, 2),), 4, "request"),
+        ("max_tokens", 1, ((1, 2),), 0, "request"),
+        ("request_id_prefix", 1, ((1, 2),), 4, ""),
     ),
 )
 def test_workload_specification_rejects_invalid_values(
     field_name: str,
     request_count: int,
-    prompt_token_ids: tuple[int, ...],
+    prompt_token_ids_by_request: tuple[tuple[int, ...], ...],
     max_tokens: int,
     request_id_prefix: str,
 ) -> None:
@@ -39,7 +41,7 @@ def test_workload_specification_rejects_invalid_values(
     with pytest.raises(ValueError, match=field_name):
         WorkloadSpecification(
             request_count=request_count,
-            prompt_token_ids=prompt_token_ids,
+            prompt_token_ids_by_request=prompt_token_ids_by_request,
             max_tokens=max_tokens,
             request_id_prefix=request_id_prefix,
         )
@@ -80,9 +82,15 @@ def test_workload_request_rejects_invalid_values(
 
 def test_generate_fixed_workload_builds_immediately_available_requests() -> None:
     """Generate deterministic requests whose arrival offsets are all zero."""
+    prompts = (
+        (10, 11, 12),
+        (20, 21, 22),
+        (30, 31, 32),
+    )
+
     specification = WorkloadSpecification(
         request_count=3,
-        prompt_token_ids=(10, 20, 30),
+        prompt_token_ids_by_request=prompts,
         max_tokens=4,
         request_id_prefix="benchmark",
     )
@@ -97,16 +105,19 @@ def test_generate_fixed_workload_builds_immediately_available_requests() -> None
         "benchmark-000002",
     )
 
-    assert all(request.prompt_token_ids == (10, 20, 30) for request in requests)
-    assert all(request.max_tokens == 4 for request in requests)
+    assert tuple(request.prompt_token_ids for request in requests) == prompts
+
     assert all(request.arrival_offset_seconds == 0.0 for request in requests)
+    assert all(request.max_tokens == 4 for request in requests)
 
 
 def test_generate_poisson_workload_is_reproducible() -> None:
     """Generate identical Poisson arrivals from the same random seed."""
+    prompts = tuple((request_index, request_index + 1) for request_index in range(10))
+
     specification = WorkloadSpecification(
         request_count=10,
-        prompt_token_ids=(1, 2),
+        prompt_token_ids_by_request=prompts,
         max_tokens=4,
     )
 
@@ -124,12 +135,14 @@ def test_generate_poisson_workload_is_reproducible() -> None:
 
     assert first == second
 
+    assert tuple(request.prompt_token_ids for request in first) == prompts
+
 
 def test_generate_poisson_workload_starts_at_zero_and_increases() -> None:
     """Start the first request at zero and accumulate later arrival times."""
     specification = WorkloadSpecification(
         request_count=5,
-        prompt_token_ids=(1,),
+        prompt_token_ids_by_request=((1,),) * 5,
         max_tokens=2,
     )
 
@@ -148,10 +161,11 @@ def test_generate_poisson_workload_starts_at_zero_and_increases() -> None:
 def test_generate_poisson_workload_matches_expected_average_interval() -> None:
     """Approximate the expected exponential inter-arrival interval."""
     request_rate_per_second = 10.0
+    request_count = 10_000
 
     specification = WorkloadSpecification(
-        request_count=10_000,
-        prompt_token_ids=(1,),
+        request_count=request_count,
+        prompt_token_ids_by_request=((1,),) * request_count,
         max_tokens=1,
     )
 
@@ -191,7 +205,7 @@ def test_generate_poisson_workload_rejects_invalid_parameters(
     """Reject invalid Poisson arrival-generation parameters."""
     specification = WorkloadSpecification(
         request_count=2,
-        prompt_token_ids=(1,),
+        prompt_token_ids_by_request=((1,), (2,)),
         max_tokens=1,
     )
 
