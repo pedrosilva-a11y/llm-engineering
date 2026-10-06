@@ -26,6 +26,7 @@ def test_request_success() -> None:
     assert request.request_id == "request-1"
     assert request.prompt_token_ids == (10, 20, 30)
     assert request.max_new_tokens == 16
+    assert request.ignore_eos is False
     assert request.arrival_time == 1.5
     assert request.sampling_parameters == sampling_parameters
 
@@ -51,6 +52,18 @@ def test_request_defaults_to_greedy_sampling() -> None:
 
     assert request.sampling_parameters == SamplingParameters()
     assert request.sampling_parameters.greedy is True
+
+
+def test_request_can_ignore_eos() -> None:
+    """Allow EOS termination to be disabled for fixed-length generation."""
+    request = Request(
+        request_id="request-1",
+        prompt_token_ids=(10, 20, 30),
+        max_new_tokens=16,
+        ignore_eos=True,
+    )
+
+    assert request.ignore_eos is True
 
 
 @pytest.mark.parametrize(

@@ -12,8 +12,9 @@ class Request:
     Attributes:
         request_id: Unique identifier for the request.
         prompt_token_ids: Tokenized prompt provided to the model.
-        max_new_tokens: Maximum number of tokens generated after the prompt,
-            including EOS if EOS is generated.
+        max_new_tokens: Maximum number of tokens generated after the prompt.
+        ignore_eos: Whether EOS tokens should be treated as ordinary generated
+            tokens until max_new_tokens is reached.
         arrival_time: Request arrival timestamp used for ordering metrics.
         sampling_parameters: Token-selection configuration used during generation.
     """
@@ -21,6 +22,7 @@ class Request:
     request_id: str
     prompt_token_ids: tuple[int, ...]
     max_new_tokens: int
+    ignore_eos: bool = False
     arrival_time: float = 0.0
     sampling_parameters: SamplingParameters = field(
         default_factory=SamplingParameters,

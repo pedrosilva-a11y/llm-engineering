@@ -188,7 +188,10 @@ class Engine:
                 parameters=sequence.request.sampling_parameters,
             )
 
-            finishes_with_eos = token_id == self.configuration.eos_token_id
+            finishes_with_eos = (
+                token_id == self.configuration.eos_token_id
+                and not sequence.request.ignore_eos
+            )
             finishes_with_length = (
                 sequence.num_generated_tokens + 1 >= sequence.request.max_new_tokens
             )

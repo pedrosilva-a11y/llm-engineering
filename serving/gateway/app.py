@@ -97,6 +97,8 @@ class CompletionRequest(BaseModel):
         prompt_token_ids: Pre-tokenized prompt supplied directly to the engine.
         max_tokens: Maximum number of generated tokens.
         stream: Whether streaming output is requested.
+        ignore_eos: Whether EOS tokens should be ignored as a termination condition
+            until max_tokens is reached.
     """
 
     model: str = Field(min_length=1)
@@ -104,6 +106,7 @@ class CompletionRequest(BaseModel):
     prompt_token_ids: list[int] | None = Field(default=None, min_length=1)
     max_tokens: int = Field(gt=0)
     stream: bool = True
+    ignore_eos: bool = False
 
     @model_validator(mode="after")
     def validate_prompt_source(self) -> Self:
@@ -377,6 +380,7 @@ def create_gateway_app(engine: Engine, tokenizer: TextTokenizer) -> FastAPI:
                 request_id=f"gateway-{uuid4().hex}",
                 prompt_token_ids=prompt_token_ids,
                 max_new_tokens=request.max_tokens,
+                ignore_eos=request.ignore_eos,
             )
 
             queue = broker.submit(engine_request)

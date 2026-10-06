@@ -528,6 +528,45 @@ def test_step_reserves_kv_for_non_terminal_generated_token() -> None:
     assert engine.scheduler.block_pool.num_allocated_blocks == 2
 
 
+def test_ignored_eos_reserves_kv_for_continued_generation() -> None:
+    """Reserve KV capacity when an ignored EOS is not the terminal token."""
+    configuration = EngineConfiguration(
+        block_size=16,
+        num_blocks=2,
+        max_sequences=1,
+        max_batched_tokens=32,
+        eos_token_id=0,
+    )
+
+    logits = torch.tensor(
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+
+    engine = Engine(
+        configuration=configuration,
+        model_runner=FixedLogitsModelRunner(logits),
+    )
+
+    request_id = "request-1"
+
+    sequence = engine.submit(
+        Request(
+            request_id=request_id,
+            prompt_token_ids=tuple(range(16)),
+            max_new_tokens=2,
+            ignore_eos=True,
+        )
+    )
+
+    finished = engine.step()
+
+    assert finished == ()
+    assert sequence.generated_token_ids == [0]
+    assert sequence.status == SequenceStatus.RUNNING
+    assert engine.scheduler.block_table.blocks_for_request(request_id) == (0, 1)
+    assert engine.scheduler.block_pool.num_allocated_blocks == 2
+
+
 def test_terminal_token_does_not_require_additional_kv_block() -> None:
     """Finish successfully without reserving KV for a terminal token."""
     configuration = EngineConfiguration(
@@ -800,6 +839,29 @@ def test_sequence_finishes_on_eos(
     assert finished_sequence.finish_reason == FinishReason.EOS
     assert finished_sequence.generated_token_ids == [5, 5, 0]
     assert finished_sequence.is_finished is True
+
+
+def test_sequence_ignores_eos_until_max_new_tokens(engine: Engine) -> None:
+    """Continue generation through EOS until the length limit is reached."""
+    request = Request(
+        request_id="request-1",
+        prompt_token_ids=(1, 2),
+        max_new_tokens=5,
+        ignore_eos=True,
+    )
+
+    engine.submit(request)
+
+    finished_sequences = engine.run_until_complete()
+
+    assert len(finished_sequences) == 1
+
+    finished_sequence = finished_sequences[0]
+
+    assert finished_sequence.status == SequenceStatus.FINISHED
+    assert finished_sequence.finish_reason == FinishReason.LENGTH
+    assert finished_sequence.num_generated_tokens == 5
+    assert finished_sequence.generated_token_ids == [5, 5, 0, 0, 0]
 
 
 def test_sequence_finishes_at_max_new_tokens(

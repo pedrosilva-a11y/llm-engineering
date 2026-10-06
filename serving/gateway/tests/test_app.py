@@ -141,6 +141,42 @@ async def test_completion_accepts_pretokenized_prompt() -> None:
 
 
 @pytest.mark.anyio
+async def test_completion_ignores_eos_until_max_tokens() -> None:
+    """Forward ignore_eos and stream until the requested length is reached."""
+    engine = _test_engine(default_eos_after=1)
+    tokenizer = FakeTextTokenizer()
+
+    async with _gateway_client(engine, tokenizer) as client:
+        response = await client.post(
+            "/v1/completions",
+            json={
+                "model": "stub-model",
+                "prompt_token_ids": [1, 2],
+                "max_tokens": 3,
+                "stream": True,
+                "ignore_eos": True,
+            },
+        )
+
+    assert response.status_code == 200
+
+    events = _sse_data_events(response)
+    payloads = [json.loads(event) for event in events[:-1]]
+
+    assert events[-1] == "[DONE]"
+    assert [payload["choices"][0]["token_id"] for payload in payloads] == [
+        5,
+        0,
+        0,
+    ]
+    assert [payload["choices"][0]["finish_reason"] for payload in payloads] == [
+        None,
+        None,
+        "length",
+    ]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "prompt_fields",
     [
@@ -425,6 +461,7 @@ async def _gateway_client(
 def _test_engine(
     *,
     configuration: EngineConfiguration | None = None,
+    default_eos_after: int = 1_000,
 ) -> Engine:
     """Create a deterministic CPU engine for gateway tests."""
     engine_configuration = configuration or EngineConfiguration()
@@ -433,7 +470,7 @@ def _test_engine(
         vocab_size=32,
         eos_token_id=engine_configuration.eos_token_id,
         generated_token_id=5,
-        default_eos_after=1_000,
+        default_eos_after=default_eos_after,
         device=engine_configuration.device,
     )
 
